@@ -756,8 +756,8 @@
       h('button', { class: 'pg', type: 'button', 'aria-label': '上一页', disabled: page <= 1, onclick: () => go(page - 1) }, '‹'),
       ...items,
       h('button', { class: 'pg', type: 'button', 'aria-label': '下一页', disabled: page >= pages, onclick: () => go(page + 1) }, '›'),
-      pages > 1 ? h('label', null, '跳至 ', jump, ' 页') : null,
     );
+    if (pages > 1) nav.append(h('label', null, '跳至 ', jump, ' 页'));
   }
 
   function costCell(row) {

@@ -52,11 +52,13 @@ func TestAccountSummary(t *testing.T) {
 		AuthIndex: "idx-a", AuthID: "id-a", Source: "src-a", Provider: "claude", AuthType: "oauth",
 		Requests: 3, Success: 2, Failed: 1, Tokens: tok(111, 222, 333, 444, 555, 666, 1110),
 		FirstRequestAt: base.Add(1 * time.Minute), LastRequestAt: base.Add(3 * time.Minute),
+		Models: []ModelUsage{{Model: "m1", Requests: 3, Success: 2, Failed: 1, Tokens: tok(111, 222, 333, 444, 555, 666, 1110)}},
 	}
 	wantB := AccountUsage{
 		AuthIndex: "idx-b", AuthID: "id-b", Source: "src-b", Provider: "codex", AuthType: "apikey",
 		Requests: 2, Success: 1, Failed: 1, Tokens: tok(3, 3, 3, 3, 3, 3, 5007),
 		FirstRequestAt: base.Add(4 * time.Minute), LastRequestAt: base.Add(5 * time.Minute),
+		Models: []ModelUsage{{Model: "m1", Requests: 2, Success: 1, Failed: 1, Tokens: tok(3, 3, 3, 3, 3, 3, 5007)}},
 	}
 	for _, c := range []struct{ got, want AccountUsage }{{a, wantA}, {b, wantB}} {
 		if !c.got.FirstRequestAt.Equal(c.want.FirstRequestAt) || !c.got.LastRequestAt.Equal(c.want.LastRequestAt) ||
@@ -553,13 +555,13 @@ func TestListRecordsQueryPlan(t *testing.T) {
 		t.Fatal(err)
 	}
 	cursorTS := formatTimestamp(base.Add(60 * time.Second))
-	const tail = " ORDER BY timestamp DESC, id DESC LIMIT ?"
+	const tail = " ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?"
 	cases := map[string]struct {
 		where string
 		args  []any
 	}{
-		"with auth_index":    {"auth_index = ? AND (timestamp, id) < (?, ?)", []any{"idx-1", cursorTS, "p120", 8}},
-		"without auth_index": {"(timestamp, id) < (?, ?)", []any{cursorTS, "p120", 8}},
+		"with auth_index":    {"auth_index = ? AND (timestamp, id) < (?, ?)", []any{"idx-1", cursorTS, "p120", 8, 0}},
+		"without auth_index": {"(timestamp, id) < (?, ?)", []any{cursorTS, "p120", 8, 0}},
 	}
 	for name, c := range cases {
 		plan := explainPlan(t, store, "SELECT "+recordColumns+" FROM usage_records WHERE "+c.where+tail, c.args...)
@@ -568,6 +570,36 @@ func TestListRecordsQueryPlan(t *testing.T) {
 		}
 		if name == "with auth_index" && !strings.Contains(plan, "SEARCH usage_records USING INDEX idx_usage_records_auth_ts") {
 			t.Errorf("%s: auth_ts index not searched:\n%s", name, plan)
+		}
+	}
+
+	// Page mode and the filters added with it: all must stay on the auth_ts index.
+	rng := "timestamp >= ? AND timestamp < ?"
+	rngArgs := []any{formatTimestamp(base), formatTimestamp(base.Add(time.Hour))}
+	strict := map[string]struct {
+		sql  string
+		args []any
+	}{
+		"auth_index+auth_id+model+failed offset": {
+			"SELECT " + recordColumns + " FROM usage_records WHERE auth_index = ? AND auth_id = ? AND model = ? AND failed = ?" + tail,
+			[]any{"idx-1", "id-1", "m1", 0, 8, 16},
+		},
+		"count": {
+			"SELECT COUNT(*) FROM usage_records WHERE auth_index = ? AND " + rng,
+			append([]any{"idx-1"}, rngArgs...),
+		},
+		"count with model+failed": {
+			"SELECT COUNT(*) FROM usage_records WHERE auth_index = ? AND " + rng + " AND model = ? AND failed = ?",
+			append(append([]any{"idx-1"}, rngArgs...), "m1", 0),
+		},
+	}
+	for name, c := range strict {
+		plan := explainPlan(t, store, c.sql, c.args...)
+		if !strings.Contains(plan, "idx_usage_records_auth_ts") {
+			t.Errorf("%s: auth_ts index unused:\n%s", name, plan)
+		}
+		if strings.Contains(plan, "USE TEMP B-TREE FOR ORDER BY") || strings.Contains(plan, "SCAN usage_records") {
+			t.Errorf("%s: bad plan:\n%s", name, plan)
 		}
 	}
 }
@@ -640,5 +672,305 @@ func TestHandleUsageGolden(t *testing.T) {
 		`"cache_creation_tokens":6,"total_tokens":7},"failed":true,"failure_status_code":429,"failure_body":"boom"}]}}`
 	if resp.StatusCode != 200 || string(resp.Body) != want {
 		t.Fatalf("status %d\n got %s\nwant %s", resp.StatusCode, resp.Body, want)
+	}
+}
+
+// --- account models, numbered paging, record filters ---
+
+func TestAccountSummaryModels(t *testing.T) {
+	store := newTestStore(t)
+	putPrices(t, store,
+		ModelPrice{Model: "big", Input: 2, Output: 8, CacheRead: 0.5, CacheCreation: 1},
+		ModelPrice{Model: "tie-b", Input: 2},
+		ModelPrice{Model: "free"}, // priced at zero: cost is 0, not null
+	)
+	base := time.Date(2026, 5, 2, 10, 0, 0, 0, time.UTC)
+	acct := func(id, model string, n int, failed bool, tk TokenStats) Record {
+		return Record{ID: id, Timestamp: base.Add(time.Duration(n) * time.Minute), AuthIndex: "idx-x", AuthID: "id-x",
+			Provider: "claude", Model: model, Tokens: tk, Failed: failed}
+	}
+	insertAll(t, store,
+		acct("1", "free", 1, false, tok(0, 0, 0, 0, 0, 0, 5)),
+		acct("2", "tie-b", 2, false, tok(1_000_000, 0, 0, 0, 0, 0, 100)),
+		acct("3", "big", 3, false, tok(1_000_000, 250_000, 0, 100_000, 0, 50_000, 200)),
+		acct("4", "big", 4, true, tok(1_000_000, 250_000, 0, 100_000, 0, 50_000, 100)),
+		acct("5", "tie-a", 5, false, tok(7, 0, 0, 0, 0, 0, 100)),
+		Record{ID: "o1", Timestamp: base, AuthIndex: "idx-y", AuthID: "id-y", Provider: "claude", Model: "big", Tokens: tok(10, 0, 0, 0, 0, 0, 3)},
+	)
+	got, err := store.AccountSummary(context.Background(), QueryRange{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var x AccountUsage
+	for _, a := range got.Accounts {
+		if a.AuthIndex == "idx-x" {
+			x = a
+		}
+	}
+	f := func(v float64) *float64 { return &v }
+	want := []ModelUsage{
+		{Model: "big", Requests: 2, Success: 1, Failed: 1, Tokens: tok(2_000_000, 500_000, 0, 200_000, 0, 100_000, 300), CostUSD: f(8.2)},
+		{Model: "tie-a", Requests: 1, Success: 1, Tokens: tok(7, 0, 0, 0, 0, 0, 100)}, // unpriced
+		{Model: "tie-b", Requests: 1, Success: 1, Tokens: tok(1_000_000, 0, 0, 0, 0, 0, 100), CostUSD: f(2)},
+		{Model: "free", Requests: 1, Success: 1, Tokens: tok(0, 0, 0, 0, 0, 0, 5), CostUSD: f(0)},
+	}
+	if len(x.Models) != len(want) {
+		t.Fatalf("models = %+v", x.Models)
+	}
+	var sum float64
+	for i, w := range want {
+		g := x.Models[i]
+		if g.Model != w.Model || g.Requests != w.Requests || g.Success != w.Success || g.Failed != w.Failed || g.Tokens != w.Tokens {
+			t.Errorf("models[%d] = %+v want %+v", i, g, w)
+		}
+		if (g.CostUSD == nil) != (w.CostUSD == nil) || (w.CostUSD != nil && !near(*g.CostUSD, *w.CostUSD)) {
+			t.Errorf("models[%d] %s cost = %v want %v", i, w.Model, g.CostUSD, w.CostUSD)
+		}
+		if g.CostUSD != nil {
+			sum += *g.CostUSD
+		}
+	}
+	if !near(sum, x.CostUSD) || !near(x.CostUSD, 10.2) {
+		t.Errorf("model cost sum %v, account cost %v", sum, x.CostUSD)
+	}
+	if !reflect.DeepEqual(x.UnpricedModels, []string{"tie-a"}) {
+		t.Errorf("unpriced = %v", x.UnpricedModels)
+	}
+	raw, _ := json.Marshal(x.Models)
+	if !strings.Contains(string(raw), `"model":"tie-a"`) || !strings.Contains(string(raw), `"cost_usd":null`) {
+		t.Errorf("json = %s", raw)
+	}
+	for _, a := range got.Accounts {
+		if a.AuthIndex == "idx-y" && (len(a.Models) != 1 || a.Models[0].Tokens.TotalTokens != 3 || a.Models[0].Requests != 1 || a.Models[0].CostUSD == nil || !near(*a.Models[0].CostUSD, 0.00002)) {
+			t.Errorf("idx-y models = %+v", a.Models)
+		}
+	}
+}
+
+// seedFilterRecords inserts 30 records: timestamps repeat in groups of three,
+// model m-x for i%3==0 else m-y, failed for i%4==0, idx-a for even i.
+func seedFilterRecords(t *testing.T, store *SQLiteStore) (recs []Record) {
+	t.Helper()
+	base := time.Date(2026, 5, 2, 10, 0, 0, 0, time.UTC)
+	for i := 0; i < 30; i++ {
+		r := Record{ID: fmt.Sprintf("f%02d", i), Timestamp: base.Add(time.Duration(i/3) * time.Minute),
+			AuthIndex: "idx-a", AuthID: "id-a", Model: "m-y", Failed: i%4 == 0}
+		if i%2 == 1 {
+			r.AuthIndex, r.AuthID = "idx-b", "id-b"
+		}
+		if i%3 == 0 {
+			r.Model = "m-x"
+		}
+		recs = append(recs, r)
+	}
+	insertAll(t, store, recs...)
+	return recs
+}
+
+// pageNumbered walks page=1.. until the end, checking total on every page.
+func pageNumbered(t *testing.T, store *SQLiteStore, q RecordsQuery) (all []RequestDetail, total int64) {
+	t.Helper()
+	for p := 1; ; p++ {
+		if p > 100 {
+			t.Fatal("numbered paging does not terminate")
+		}
+		q.Page = p
+		page, err := store.ListRecords(context.Background(), q)
+		if err != nil {
+			t.Fatalf("page %d: %v", p, err)
+		}
+		if page.Total == nil {
+			t.Fatalf("page %d: total missing", p)
+		}
+		if p == 1 {
+			total = *page.Total
+		} else if *page.Total != total {
+			t.Fatalf("page %d: total %d != %d", p, *page.Total, total)
+		}
+		if len(page.Records) > q.Limit {
+			t.Fatalf("page %d too large: %d", p, len(page.Records))
+		}
+		if len(page.Records) == 0 {
+			return all, total
+		}
+		for _, r := range page.Records {
+			all = append(all, r.RequestDetail)
+		}
+	}
+}
+
+func ids(ds []RequestDetail) []string {
+	out := make([]string, len(ds))
+	for i, d := range ds {
+		out[i] = d.ID
+	}
+	return out
+}
+
+func TestListRecordsPageMode(t *testing.T) {
+	store := newTestStore(t)
+	seedFilterRecords(t, store)
+	ctx := context.Background()
+	for _, c := range []struct {
+		page, limit, want int
+	}{{1, 7, 7}, {2, 7, 7}, {5, 7, 2}, {6, 7, 0}, {100, 7, 0}, {3, 10, 10}, {4, 10, 0}, {1, 30, 30}, {2, 30, 0}, {1, 1000, 30}} {
+		page, err := store.ListRecords(ctx, RecordsQuery{Limit: c.limit, Page: c.page})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if page.Records == nil || len(page.Records) != c.want || page.Total == nil || *page.Total != 30 {
+			t.Errorf("page %d limit %d: %d records total=%v", c.page, c.limit, len(page.Records), page.Total)
+		}
+	}
+	// Page 1 and 2 are the newest records, in order.
+	p1, _ := store.ListRecords(ctx, RecordsQuery{Limit: 3, Page: 1})
+	p2, _ := store.ListRecords(ctx, RecordsQuery{Limit: 3, Page: 2})
+	if got := ids([]RequestDetail{p1.Records[0].RequestDetail, p1.Records[2].RequestDetail, p2.Records[0].RequestDetail}); strings.Join(got, ",") != "f29,f27,f26" {
+		t.Errorf("order = %v", got)
+	}
+	// Empty store: total 0, empty records.
+	empty := newTestStore(t)
+	page, err := empty.ListRecords(ctx, RecordsQuery{Limit: 5, Page: 1})
+	if err != nil || page.Total == nil || *page.Total != 0 || page.Records == nil || len(page.Records) != 0 {
+		t.Errorf("empty = %+v err=%v", page, err)
+	}
+	// Cursor mode carries no total.
+	page, _ = store.ListRecords(ctx, RecordsQuery{Limit: 5})
+	if page.Total != nil {
+		t.Errorf("cursor mode total = %d", *page.Total)
+	}
+}
+
+func TestListRecordsPageMatchesCursorWalkAndFilters(t *testing.T) {
+	store := newTestStore(t)
+	recs := seedFilterRecords(t, store)
+	yes, no := true, false
+	base := time.Date(2026, 5, 2, 10, 0, 0, 0, time.UTC)
+	start, end := base.Add(2*time.Minute), base.Add(7*time.Minute)
+	cases := map[string]struct {
+		q     RecordsQuery
+		match func(Record) bool
+	}{
+		"none":              {RecordsQuery{}, func(Record) bool { return true }},
+		"model":             {RecordsQuery{Model: "m-x"}, func(r Record) bool { return r.Model == "m-x" }},
+		"model no match":    {RecordsQuery{Model: "nope"}, func(Record) bool { return false }},
+		"model exact":       {RecordsQuery{Model: "m"}, func(Record) bool { return false }},
+		"failed true":       {RecordsQuery{Failed: &yes}, func(r Record) bool { return r.Failed }},
+		"failed false":      {RecordsQuery{Failed: &no}, func(r Record) bool { return !r.Failed }},
+		"model+failed":      {RecordsQuery{Model: "m-y", Failed: &no}, func(r Record) bool { return r.Model == "m-y" && !r.Failed }},
+		"auth_index":        {RecordsQuery{AuthIndex: "idx-a"}, func(r Record) bool { return r.AuthIndex == "idx-a" }},
+		"all filters":       {RecordsQuery{AuthIndex: "idx-a", AuthID: "id-a", Model: "m-x", Failed: &yes}, func(r Record) bool { return r.AuthIndex == "idx-a" && r.Model == "m-x" && r.Failed }},
+		"range+failed true": {RecordsQuery{Range: QueryRange{Start: &start, End: &end}, Failed: &yes}, func(r Record) bool { return r.Failed && !r.Timestamp.Before(start) && r.Timestamp.Before(end) }},
+	}
+	for name, c := range cases {
+		var want int
+		for _, r := range recs {
+			if c.match(r) {
+				want++
+			}
+		}
+		for _, limit := range []int{1, 4, 7, 100} {
+			q := c.q
+			q.Limit = limit
+			cursor := pageAll(t, store, q)
+			paged, total := pageNumbered(t, store, q)
+			if len(cursor) != want || int(total) != want || len(paged) != want {
+				t.Errorf("%s limit %d: cursor=%d paged=%d total=%d want %d", name, limit, len(cursor), len(paged), total, want)
+				continue
+			}
+			if !reflect.DeepEqual(ids(cursor), ids(paged)) {
+				t.Errorf("%s limit %d: cursor %v != paged %v", name, limit, ids(cursor), ids(paged))
+			}
+			assertStrictlyDescending(t, paged)
+			byID := map[string]Record{}
+			for _, r := range recs {
+				byID[r.ID] = r
+			}
+			for _, d := range paged {
+				if !c.match(byID[d.ID]) {
+					t.Errorf("%s: leaked %s", name, d.ID)
+				}
+			}
+		}
+	}
+}
+
+func TestHandleRecordsPageAndFilters(t *testing.T) {
+	store := newTestStore(t)
+	useStore(t, store)
+	seedFilterRecords(t, store)
+
+	for query, want := range map[string]string{
+		"failed=maybe":         `{"error":"invalid failed"}`,
+		"page=0":               `{"error":"invalid page"}`,
+		"page=-1":              `{"error":"invalid page"}`,
+		"page=abc":             `{"error":"invalid page"}`,
+		"page=1.5":             `{"error":"invalid page"}`,
+		"page=1000001":         `{"error":"invalid page"}`,
+		"page=abc&cursor=xyz":  `{"error":"invalid page"}`,
+		"page=1&cursor=xyz":    `{"error":"page and cursor cannot be combined"}`,
+		"page=2&cursor=%21%21": `{"error":"page and cursor cannot be combined"}`,
+	} {
+		r := callManagement(t, "GET", hostRecords, query)
+		if r.StatusCode != 400 || strings.TrimSpace(string(r.Body)) != want {
+			t.Errorf("%s: %d %s", query, r.StatusCode, r.Body)
+		}
+	}
+
+	keys := func(r managementResponse) map[string]json.RawMessage {
+		t.Helper()
+		if r.StatusCode != 200 {
+			t.Fatalf("status %d body %s", r.StatusCode, r.Body)
+		}
+		m := map[string]json.RawMessage{}
+		if err := json.Unmarshal(r.Body, &m); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	if _, ok := keys(callManagement(t, "GET", hostRecords, "limit=5"))["total"]; ok {
+		t.Error("cursor mode body has total key")
+	}
+	m := keys(callManagement(t, "GET", hostRecords, "limit=5&page=1"))
+	if string(m["total"]) != "30" {
+		t.Errorf("page mode total = %s", m["total"])
+	}
+	// Max page is accepted; far past the end is an empty page with the total.
+	r := callManagement(t, "GET", hostRecords, "page=1000000&limit=1000")
+	if page := decodePage(t, r); len(page.Records) != 0 || page.Total == nil || *page.Total != 30 {
+		t.Errorf("max page = %s", r.Body)
+	}
+
+	// Filters through the handler, both modes.
+	page := decodePage(t, callManagement(t, "GET", hostRecords, "model=m-x&failed=true&limit=100"))
+	if len(page.Records) != 3 || page.Total != nil { // i = 0, 12, 24
+		t.Errorf("cursor filter = %+v", page.Records)
+	}
+	for _, f := range []string{"true", "1", "T"} {
+		page = decodePage(t, callManagement(t, "GET", hostRecords, "failed="+f+"&page=1&limit=5"))
+		if page.Total == nil || *page.Total != 8 || len(page.Records) != 5 { // i%4==0 -> 8
+			t.Errorf("failed=%s page = total %v n %d", f, page.Total, len(page.Records))
+		}
+	}
+	page = decodePage(t, callManagement(t, "GET", hostRecords, "failed=false&model=m-y&page=2&limit=10"))
+	if page.Total == nil || *page.Total != 15 || len(page.Records) != 5 {
+		t.Errorf("failed=false page = total %v n %d", page.Total, len(page.Records))
+	}
+	page = decodePage(t, callManagement(t, "GET", hostRecords, "failed=&model=&page=1"))
+	if page.Total == nil || *page.Total != 30 {
+		t.Errorf("blank filters total = %v", page.Total)
+	}
+}
+
+func TestHandleRecordsNilStore(t *testing.T) {
+	useStore(t, nil)
+	for query, want := range map[string]string{
+		"page=1": `{"records":[],"next_cursor":null,"total":0}`,
+		"":       `{"records":[],"next_cursor":null}`,
+	} {
+		r := callManagement(t, "GET", hostRecords, query)
+		if r.StatusCode != 200 || strings.TrimSpace(string(r.Body)) != want {
+			t.Errorf("%q: %d %s", query, r.StatusCode, r.Body)
+		}
 	}
 }
