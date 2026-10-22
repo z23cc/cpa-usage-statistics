@@ -29,6 +29,9 @@ var (
 	dailyRollup   = rollupTable{name: "usage_daily", bucketLen: len(dayBucketLayout)}
 	rollupTables  = []rollupTable{hourlyRollup, dailyRollup}
 	rawSummaryKey = "usage_records"
+	// cleanedHourKey marks a piece holding the records of one hour whose details
+	// retention already deleted: that hour's rollup minus its kept details.
+	cleanedHourKey = "cleaned_hour"
 )
 
 // rollupSumColumns are the usage_records columns summed into the rollups.
@@ -170,18 +173,18 @@ type summaryPiece struct {
 
 // planSummaryPieces splits [start, end) into whole days (daily rollup), the
 // whole hours around them (hourly rollup) and the partial hours at the ends
-// (details). A detail slice that starts before detailsSince, whose details
-// were cleaned up, is read as its whole hour bucket instead: that end of the
-// range snaps outward to the hour. With no details at all, every slice does.
+// (details). Kept details answer those partial hours exactly. When a partial
+// slice reaches before detailsSince (or no details are kept at all), the
+// records retention deleted from that hour are added as a cleaned-hour piece:
+// only that cleaned part snaps outward to the hour, and it is empty when
+// nothing was ever cleaned, so ranges without retention stay exact.
 func planSummaryPieces(start, end, detailsSince *time.Time) []summaryPiece {
 	var pieces []summaryPiece
 	detailsOrHour := func(from, to time.Time) {
-		if detailsSince == nil || from.Before(*detailsSince) {
-			hour := from.Truncate(time.Hour)
-			pieces = append(pieces, summaryPiece{hourlyRollup.name, hourKey(hour), hourKey(hour.Add(time.Hour))})
-			return
-		}
 		pieces = append(pieces, summaryPiece{rawSummaryKey, formatTimestamp(from), formatTimestamp(to)})
+		if detailsSince == nil || from.Before(*detailsSince) {
+			pieces = append(pieces, summaryPiece{table: cleanedHourKey, from: hourKey(from.Truncate(time.Hour))})
+		}
 	}
 	rollup := func(t rollupTable, hasFrom bool, from time.Time, hasTo bool, to time.Time, key func(time.Time) string) {
 		piece := summaryPiece{table: t.name}
@@ -309,6 +312,9 @@ func summaryPieceSQL(piece summaryPiece) (string, []any) {
 }
 
 func scanSummaryPiece(ctx context.Context, tx *sql.Tx, piece summaryPiece, groups map[summaryGroupKey]*summaryGroup) error {
+	if piece.table == cleanedHourKey {
+		return scanCleanedHour(ctx, tx, piece.from, groups)
+	}
 	query, args := summaryPieceSQL(piece)
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -324,26 +330,72 @@ func scanSummaryPiece(ctx context.Context, tx *sql.Tx, piece summaryPiece, group
 			&g.pureInput, &g.first, &g.last); err != nil {
 			return fmt.Errorf("usage sqlite summary scan: %w", err)
 		}
-		key := summaryGroupKey{g.authIndex, g.authID, g.model}
-		existing, ok := groups[key]
-		if !ok {
-			groups[key] = &g
-			continue
-		}
-		existing.source = max(existing.source, g.source)
-		existing.provider = max(existing.provider, g.provider)
-		existing.authType = max(existing.authType, g.authType)
-		existing.requests += g.requests
-		existing.failed += g.failed
-		addTokens(&existing.tokens, g.tokens)
-		existing.pureInput += g.pureInput
-		existing.first = min(existing.first, g.first)
-		existing.last = max(existing.last, g.last)
+		mergeSummaryGroup(groups, &g)
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("usage sqlite summary rows: %w", err)
 	}
 	return nil
+}
+
+// scanCleanedHour adds the records of hour that retention deleted: the hour's
+// rollup minus the details still kept for it. Deleted records all precede the
+// kept ones, so the bucket's first_ts is theirs; their last time is unknown
+// and first_ts stands in for it.
+func scanCleanedHour(ctx context.Context, tx *sql.Tx, hour string, groups map[summaryGroupKey]*summaryGroup) error {
+	start, err := time.Parse(hourBucketLayout, hour)
+	if err != nil {
+		return fmt.Errorf("usage sqlite cleaned hour %q: %w", hour, err)
+	}
+	end := start.Add(time.Hour)
+	rolled := make(map[summaryGroupKey]*summaryGroup)
+	kept := make(map[summaryGroupKey]*summaryGroup)
+	if err := scanSummaryPiece(ctx, tx, summaryPiece{hourlyRollup.name, hourKey(start), hourKey(end)}, rolled); err != nil {
+		return err
+	}
+	if err := scanSummaryPiece(ctx, tx, summaryPiece{rawSummaryKey, formatTimestamp(start), formatTimestamp(end)}, kept); err != nil {
+		return err
+	}
+	for key, cleaned := range rolled {
+		if k, ok := kept[key]; ok {
+			cleaned.requests -= k.requests
+			cleaned.failed -= k.failed
+			cleaned.pureInput -= k.pureInput
+			cleaned.tokens = TokenStats{
+				InputTokens:         cleaned.tokens.InputTokens - k.tokens.InputTokens,
+				OutputTokens:        cleaned.tokens.OutputTokens - k.tokens.OutputTokens,
+				ReasoningTokens:     cleaned.tokens.ReasoningTokens - k.tokens.ReasoningTokens,
+				CachedTokens:        cleaned.tokens.CachedTokens - k.tokens.CachedTokens,
+				CacheReadTokens:     cleaned.tokens.CacheReadTokens - k.tokens.CacheReadTokens,
+				CacheCreationTokens: cleaned.tokens.CacheCreationTokens - k.tokens.CacheCreationTokens,
+				TotalTokens:         cleaned.tokens.TotalTokens - k.tokens.TotalTokens,
+			}
+			cleaned.last = cleaned.first
+		}
+		if cleaned.requests > 0 {
+			mergeSummaryGroup(groups, cleaned)
+		}
+	}
+	return nil
+}
+
+// mergeSummaryGroup folds g into groups with the summary's MAX/SUM/MIN rules.
+func mergeSummaryGroup(groups map[summaryGroupKey]*summaryGroup, g *summaryGroup) {
+	key := summaryGroupKey{g.authIndex, g.authID, g.model}
+	existing, ok := groups[key]
+	if !ok {
+		groups[key] = g
+		return
+	}
+	existing.source = max(existing.source, g.source)
+	existing.provider = max(existing.provider, g.provider)
+	existing.authType = max(existing.authType, g.authType)
+	existing.requests += g.requests
+	existing.failed += g.failed
+	addTokens(&existing.tokens, g.tokens)
+	existing.pureInput += g.pureInput
+	existing.first = min(existing.first, g.first)
+	existing.last = max(existing.last, g.last)
 }
 
 // detailsSince returns the earliest retained record, or nil when there is none.
