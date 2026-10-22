@@ -122,6 +122,9 @@ type UsageTotals struct {
 type AccountsResponse struct {
 	Accounts []AccountUsage `json:"accounts"`
 	Totals   UsageTotals    `json:"totals"`
+	// DetailsSince is the earliest retained record (null with none). Ranges
+	// before it come from the rollups only and start on the hour.
+	DetailsSince *time.Time `json:"details_since"`
 }
 
 // RecordsQuery selects one page of records, newest first.

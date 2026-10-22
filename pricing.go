@@ -17,9 +17,16 @@ const (
 	maxPricePerMTok    = 10000
 )
 
-// pureInputSQL is the SQL form of pureInputTokens, used when aggregating.
-const pureInputSQL = `CASE WHEN lower(provider) LIKE '%claude%' OR lower(provider) LIKE '%anthropic%'
-       THEN input_tokens ELSE MAX(input_tokens - cached_tokens - cache_creation_tokens, 0) END`
+// pureInputExpr is the SQL form of pureInputTokens over columns named with
+// prefix ("" in queries, "NEW."/"OLD." in the rollup triggers), so every
+// aggregate shares one formula.
+func pureInputExpr(prefix string) string {
+	return `CASE WHEN lower(` + prefix + `provider) LIKE '%claude%' OR lower(` + prefix + `provider) LIKE '%anthropic%'
+       THEN ` + prefix + `input_tokens ELSE MAX(` + prefix + `input_tokens - ` + prefix + `cached_tokens - ` + prefix + `cache_creation_tokens, 0) END`
+}
+
+// pureInputSQL is pureInputExpr over unprefixed usage_records columns.
+var pureInputSQL = pureInputExpr("")
 
 // isAnthropicProvider mirrors the panel: Claude/Anthropic input_tokens exclude
 // cache tokens, every other provider includes them.
@@ -121,15 +128,16 @@ func (s *SQLiteStore) priceFor(model string) (ModelPrice, bool) {
 	return price, ok
 }
 
-// Prices returns every stored price plus the models seen in usage records.
+// Prices returns every stored price plus the models seen in usage, read from
+// the daily rollup so models whose details were cleaned up still show.
 func (s *SQLiteStore) Prices(ctx context.Context) (PricesResponse, error) {
 	result := PricesResponse{Prices: []ModelPrice{}, ModelsSeen: []string{}}
-	if s == nil || s.db == nil {
+	if s == nil || s.rdb == nil {
 		return result, nil
 	}
 	result.Prices = s.cachedPrices()
 
-	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT model FROM usage_records ORDER BY model`)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT DISTINCT model FROM usage_daily ORDER BY model`)
 	if err != nil {
 		return result, fmt.Errorf("usage sqlite models seen: %w", err)
 	}

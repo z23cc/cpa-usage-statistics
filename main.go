@@ -41,8 +41,9 @@ const (
 	// insertTimeout is long because the host drops a record whose usage.handle
 	// fails and never retries; its queue is unbounded, so waiting behind a read
 	// on the single connection only delays the record.
-	insertTimeout = 30 * time.Second
-	queryTimeout  = 5 * time.Second
+	insertTimeout   = 30 * time.Second
+	queryTimeout    = 5 * time.Second
+	cleanupInterval = time.Hour
 
 	defaultRecordsLimit = 100
 	maxRecordsLimit     = 1000
@@ -51,7 +52,7 @@ const (
 
 // Overridable at build time via -ldflags "-X main.pluginVersion=...".
 var (
-	pluginVersion    = "0.4.0-acct.1"
+	pluginVersion    = "0.5.0-acct.1"
 	pluginAuthor     = "Fwindy"
 	pluginRepository = "https://github.com/Fwindy/cpa-usage-statistics"
 )
@@ -145,7 +146,7 @@ func registerResponse() registerResponsePayload {
 			GitHubRepository: pluginRepository,
 			ConfigFields: []configFieldInfo{
 				{Name: "data_dir", Type: "string", Description: "Directory for usage.db. Defaults to ~/.cli-proxy-api/plugins/usage-statistics."},
-				{Name: "retention_days", Type: "integer", Description: "Delete usage records older than this many days. 0 disables cleanup."},
+				{Name: "retention_days", Type: "integer", Description: "Delete per-request records older than this many days (hourly/daily rollups are kept). 0 disables cleanup."},
 			},
 		},
 		Capabilities: capabilitiesInfo{UsagePlugin: true, ManagementAPI: true},
@@ -241,7 +242,6 @@ func handleUsage(request []byte) ([]byte, error) {
 	if err := store.Insert(ctx, toRecord(rec)); err != nil {
 		return nil, err
 	}
-	maybeCleanup()
 	return okEnvelope(map[string]any{"stored": true})
 }
 
@@ -605,8 +605,10 @@ var (
 
 	retentionDays atomic.Int64
 
-	cleanupMu   sync.Mutex
-	lastCleanup time.Time
+	// The retention cleanup goroutine; see startCleanup.
+	cleanupMu     sync.Mutex
+	cleanupCancel context.CancelFunc
+	cleanupDone   chan struct{}
 
 	// quiesced is set by plugin.quiesce, which the host sends to the old
 	// instance right before a hot reload loads the new one. Closing the db then
@@ -635,9 +637,10 @@ func currentStore() *SQLiteStore {
 	return globalStore
 }
 
-// closeStore detaches the store first so new callers see nil at once, then
-// waits for in-flight work in Close without holding storeMu.
+// closeStore stops the cleanup, detaches the store so new callers see nil at
+// once, then waits for in-flight work in Close without holding storeMu.
 func closeStore() {
+	stopCleanup()
 	storeMu.Lock()
 	store := globalStore
 	globalStore = nil
@@ -670,28 +673,54 @@ func ensureStore(cfg pluginConfig) error {
 	return nil
 }
 
-func maybeCleanup() {
-	days := retentionDays.Load()
-	if days <= 0 {
+// startCleanup (re)starts the retention cleanup in the background: once now,
+// then every cleanupInterval. It never runs on the usage.handle path, so a
+// large delete cannot stall the host's serial usage queue.
+func startCleanup() {
+	stopCleanup()
+	if retentionDays.Load() <= 0 {
 		return
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
 	cleanupMu.Lock()
-	now := time.Now()
-	if !lastCleanup.IsZero() && now.Sub(lastCleanup) < time.Hour {
-		cleanupMu.Unlock()
-		return
-	}
-	lastCleanup = now
+	cleanupCancel, cleanupDone = cancel, done
 	cleanupMu.Unlock()
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(cleanupInterval)
+		defer ticker.Stop()
+		for {
+			runCleanup(ctx)
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+}
 
+// stopCleanup cancels the cleanup and waits for it to exit, so it never runs
+// against a store that is being closed.
+func stopCleanup() {
+	cleanupMu.Lock()
+	cancel, done := cleanupCancel, cleanupDone
+	cleanupCancel, cleanupDone = nil, nil
+	cleanupMu.Unlock()
+	if cancel != nil {
+		cancel()
+		<-done
+	}
+}
+
+func runCleanup(ctx context.Context) {
+	days := retentionDays.Load()
 	store := currentStore()
-	if store == nil {
+	if days <= 0 || store == nil {
 		return
 	}
-	cutoff := now.Add(-time.Duration(days) * 24 * time.Hour)
-	ctx, cancel := context.WithTimeout(context.Background(), insertTimeout)
-	defer cancel()
-	_, _ = store.DeleteBefore(ctx, cutoff)
+	_, _ = store.DeleteBefore(ctx, time.Now().Add(-time.Duration(days)*24*time.Hour))
 }
 
 // ---- config ----------------------------------------------------------------
@@ -721,12 +750,7 @@ func configurePlugin(request []byte) error {
 	// A register after quiesce (e.g. the host rolling back a failed reload)
 	// has just reopened the store, so resume normal service.
 	quiesced.Store(false)
-	if cfg.RetentionDays > 0 {
-		cleanupMu.Lock()
-		lastCleanup = time.Time{}
-		cleanupMu.Unlock()
-		maybeCleanup()
-	}
+	startCleanup()
 	return nil
 }
 

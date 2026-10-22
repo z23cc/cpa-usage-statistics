@@ -225,6 +225,7 @@
       <select class="field" id="fModel" aria-label="按模型筛选"></select>
       <span class="note">失败的请求可点击查看原因</span>
     </div>
+    <div class="note" id="recNote" style="margin:6px 16px 0" hidden></div>
     <div class="panel">
       <table id="recTable" aria-label="请求明细">
         <thead><tr>
@@ -1011,6 +1012,14 @@
     $('fModel').replaceChildren(h('option', { value: '' }, '全部模型'), ...models.map((m) => h('option', { value: m.model }, m.model)));
     $('fModel').value = state.rec.model;
     $('fResult').value = state.rec.result;
+    // Summaries come from rollups that outlive the per-request details: say so
+    // only when this account has rolled-up requests older than any kept detail.
+    const since = state.accounts.details_since ? Date.parse(state.accounts.details_since) : null;
+    const recNote = $('recNote');
+    recNote.hidden = !(since == null || Date.parse(u.first_request_at) < since);
+    recNote.textContent = since == null
+      ? '这个时间段的逐条明细都已清理，上面的汇总不受影响。'
+      : `${fmtDateTime(since, true)} 以前的逐条明细已清理（下面只列出之后的请求），上面的汇总不受影响。`;
   }
   function setRecordsFilter(changes) {
     Object.assign(state.rec, changes, { page: 1 });

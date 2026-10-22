@@ -18,9 +18,18 @@ import (
 
 const sqliteTimestampLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
-// sqliteBusyTimeoutPragma makes a database locked by another process wait
-// instead of failing at once with SQLITE_BUSY (the driver default is 0).
-const sqliteBusyTimeoutPragma = "?_pragma=busy_timeout(3000)"
+// The writer runs in WAL mode so the readers never block it. busy_timeout makes
+// a database locked by another process wait instead of failing at once with
+// SQLITE_BUSY (the driver default is 0). synchronous(NORMAL) is safe in WAL:
+// a power loss may drop the last commits but never corrupts the database.
+// query_only keeps the read pool from ever writing.
+const (
+	sqliteWriterParams = "?_pragma=busy_timeout(3000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+	sqliteReaderParams = "?_pragma=busy_timeout(3000)&_pragma=query_only(1)"
+	readPoolSize       = 4
+	// cleanupBatchSize bounds how long one retention batch holds the writer.
+	cleanupBatchSize = 10000
+)
 
 // recordColumns is the column list scanned by scanRequestDetail, in order.
 const recordColumns = `id, timestamp, api_key, provider, model, alias, source, auth_id, auth_index, auth_type, executor_type,
@@ -33,7 +42,9 @@ var errInvalidCursor = errors.New("invalid cursor")
 
 // SQLiteStore persists usage records in a pure-Go SQLite database.
 type SQLiteStore struct {
-	db *sql.DB
+	// db is the single writer connection; rdb is the read-only pool.
+	db  *sql.DB
+	rdb *sql.DB
 
 	// prices caches model_prices so cost math never touches the single connection.
 	pricesMu sync.RWMutex
@@ -50,20 +61,35 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 	if err := prepareSQLitePath(path); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", path+sqliteBusyTimeoutPragma)
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", path+sqliteWriterParams)
 	if err != nil {
 		return nil, fmt.Errorf("usage sqlite open: %w", err)
 	}
 	db.SetMaxOpenConns(1)
 	store := &SQLiteStore{db: db}
-	if err := store.initSchema(context.Background()); err != nil {
+	var mode string
+	if err := db.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&mode); err != nil || !strings.EqualFold(mode, "wal") {
+		_ = db.Close()
+		return nil, fmt.Errorf("usage sqlite journal mode is %q, want wal: %v", mode, err)
+	}
+	if err := store.initSchema(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	// Prices only affect cost display; never let them stop usage recording.
-	if err := store.loadPrices(context.Background()); err != nil {
+	if err := store.loadPrices(ctx); err != nil {
 		store.setPrices(map[string]ModelPrice{})
 	}
+	// Opened after the writer has switched the file to WAL.
+	rdb, err := sql.Open("sqlite", path+sqliteReaderParams)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("usage sqlite open readers: %w", err)
+	}
+	rdb.SetMaxOpenConns(readPoolSize)
+	rdb.SetMaxIdleConns(readPoolSize)
+	store.rdb = rdb
 	return store, nil
 }
 
@@ -131,7 +157,11 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_usage_records_auth_ts ON usage_records(auth_index, timestamp, id)`); err != nil {
 		return fmt.Errorf("usage sqlite init schema: %w", err)
 	}
-	return s.initPriceSchema(ctx)
+	if err := s.initPriceSchema(ctx); err != nil {
+		return err
+	}
+	// Last: the rollup triggers read columns migrateSchema may have just added.
+	return s.initRollup(ctx)
 }
 
 // migrateSchema 让老版本 db 的字段自愈到最新：用 table_info 读出现有列，
@@ -262,7 +292,7 @@ INSERT INTO usage_records (
 
 // Query returns usage grouped by api_key (or provider) then model.
 func (s *SQLiteStore) Query(ctx context.Context, rng QueryRange) (APIUsage, error) {
-	if s == nil || s.db == nil {
+	if s == nil || s.rdb == nil {
 		return APIUsage{}, nil
 	}
 	where, args := rangeWhere(rng)
@@ -272,7 +302,7 @@ func (s *SQLiteStore) Query(ctx context.Context, rng QueryRange) (APIUsage, erro
 	}
 	query += " ORDER BY timestamp ASC, id ASC"
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.rdb.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("usage sqlite query: %w", err)
 	}
@@ -298,68 +328,61 @@ func (s *SQLiteStore) Query(ctx context.Context, rng QueryRange) (APIUsage, erro
 }
 
 // AccountSummary aggregates usage per credential (auth_index + auth_id) within
-// rng, ordered by total tokens descending. SQL groups per model as well so each
-// model's price applies to its own tokens; the groups are merged per account here.
-// ponytail: scans every row in rng (~1 s per 500k rows) while holding the only
-// connection, so concurrent inserts wait; pass start/end or set retention_days,
-// add a daily rollup table if unbounded queries over millions of rows are needed.
+// rng, ordered by total tokens descending. Whole days and hours come from the
+// rollups and only the partial hours at the ends from the details (see
+// planSummaryPieces), all read in one snapshot. Groups stay per model so each
+// model's price applies to its own tokens; they are merged per account here.
 func (s *SQLiteStore) AccountSummary(ctx context.Context, rng QueryRange) (AccountsResponse, error) {
 	result := AccountsResponse{Accounts: []AccountUsage{}}
-	if s == nil || s.db == nil {
+	if s == nil || s.rdb == nil {
 		return result, nil
 	}
-	where, args := rangeWhere(rng)
-	query := `
-SELECT auth_index, auth_id, model, MAX(source), MAX(provider), MAX(auth_type),
-       COUNT(*), SUM(failed),
-       SUM(input_tokens), SUM(output_tokens), SUM(reasoning_tokens), SUM(cached_tokens),
-       SUM(cache_read_tokens), SUM(cache_creation_tokens), SUM(total_tokens),
-       SUM(` + pureInputSQL + `),
-       MIN(timestamp), MAX(timestamp)
-FROM usage_records`
-	if len(where) > 0 {
-		query += " WHERE " + strings.Join(where, " AND ")
-	}
-	query += " GROUP BY auth_index, auth_id, model"
-
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	// One read transaction: every piece sees the same WAL snapshot.
+	tx, err := s.rdb.BeginTx(ctx, nil)
 	if err != nil {
-		return result, fmt.Errorf("usage sqlite account summary: %w", err)
+		return result, fmt.Errorf("usage sqlite account summary begin: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
+	defer func() { _ = tx.Rollback() }()
+	since, err := detailsSince(ctx, tx)
+	if err != nil {
+		return result, err
+	}
+	result.DetailsSince = since
+	groups := make(map[summaryGroupKey]*summaryGroup)
+	for _, piece := range planSummaryPieces(rng.Start, rng.End, since) {
+		if err := scanSummaryPiece(ctx, tx, piece, groups); err != nil {
+			return result, err
+		}
+	}
+	// Same order the per-model SQL GROUP BY produced, so float cost sums match.
+	keys := make([]summaryGroupKey, 0, len(groups))
+	for key := range groups {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		a, b := keys[i], keys[j]
+		if a.authIndex != b.authIndex {
+			return a.authIndex < b.authIndex
+		}
+		if a.authID != b.authID {
+			return a.authID < b.authID
+		}
+		return a.model < b.model
+	})
 
 	type accountKey struct{ authIndex, authID string }
 	accounts := make(map[accountKey]*AccountUsage)
-	for rows.Next() {
-		var group AccountUsage
-		var model, firstText, lastText string
-		var pureInput int64
-		if err := rows.Scan(
-			&group.AuthIndex,
-			&group.AuthID,
-			&model,
-			&group.Source,
-			&group.Provider,
-			&group.AuthType,
-			&group.Requests,
-			&group.Failed,
-			&group.Tokens.InputTokens,
-			&group.Tokens.OutputTokens,
-			&group.Tokens.ReasoningTokens,
-			&group.Tokens.CachedTokens,
-			&group.Tokens.CacheReadTokens,
-			&group.Tokens.CacheCreationTokens,
-			&group.Tokens.TotalTokens,
-			&pureInput,
-			&firstText,
-			&lastText,
-		); err != nil {
-			return result, fmt.Errorf("usage sqlite account summary scan: %w", err)
+	for _, gk := range keys {
+		g := groups[gk]
+		model, pureInput := g.model, g.pureInput
+		group := AccountUsage{
+			AuthIndex: g.authIndex, AuthID: g.authID, Source: g.source, Provider: g.provider, AuthType: g.authType,
+			Requests: g.requests, Failed: g.failed, Tokens: g.tokens,
 		}
-		if group.FirstRequestAt, err = parseStoredTimestamp(firstText); err != nil {
+		if group.FirstRequestAt, err = parseStoredTimestamp(g.first); err != nil {
 			return result, err
 		}
-		if group.LastRequestAt, err = parseStoredTimestamp(lastText); err != nil {
+		if group.LastRequestAt, err = parseStoredTimestamp(g.last); err != nil {
 			return result, err
 		}
 		// Taken before merging: the first group becomes the account itself.
@@ -386,9 +409,6 @@ FROM usage_records`
 			account.UnpricedModels = append(account.UnpricedModels, model)
 		}
 		account.Models = append(account.Models, modelUsage)
-	}
-	if err := rows.Err(); err != nil {
-		return result, fmt.Errorf("usage sqlite account summary rows: %w", err)
 	}
 
 	for _, account := range accounts {
@@ -461,12 +481,18 @@ func (s *SQLiteStore) ListRecords(ctx context.Context, q RecordsQuery) (RecordsP
 		var zero int64
 		page.Total = &zero
 	}
-	if s == nil || s.db == nil {
+	if s == nil || s.rdb == nil {
 		return page, nil
 	}
 	if q.Limit <= 0 {
 		return page, fmt.Errorf("usage sqlite list records: limit must be positive")
 	}
+	// The count and the page come from one snapshot, so they always agree.
+	tx, err := s.rdb.BeginTx(ctx, nil)
+	if err != nil {
+		return page, fmt.Errorf("usage sqlite list records begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
 	where, args := rangeWhere(q.Range)
 	if q.AuthIndex != "" {
 		where = append(where, "auth_index = ?")
@@ -490,7 +516,7 @@ func (s *SQLiteStore) ListRecords(ctx context.Context, q RecordsQuery) (RecordsP
 		if len(where) > 0 {
 			countQuery += " WHERE " + strings.Join(where, " AND ")
 		}
-		if err := s.db.QueryRowContext(ctx, countQuery, args...).Scan(page.Total); err != nil {
+		if err := tx.QueryRowContext(ctx, countQuery, args...).Scan(page.Total); err != nil {
 			return page, fmt.Errorf("usage sqlite count records: %w", err)
 		}
 		offset = (q.Page - 1) * q.Limit
@@ -517,7 +543,7 @@ func (s *SQLiteStore) ListRecords(ctx context.Context, q RecordsQuery) (RecordsP
 	query += " ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?"
 	args = append(args, q.Limit+1, offset)
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return page, fmt.Errorf("usage sqlite list records: %w", err)
 	}
@@ -683,35 +709,83 @@ func (s *SQLiteStore) Delete(ctx context.Context, ids []string) (DeleteResult, e
 	return result, nil
 }
 
-// DeleteBefore removes records older than cutoff and returns the deleted count.
+// DeleteBefore removes records older than cutoff for retention and returns the
+// deleted count. The rollups keep them: each batch turns the delete trigger off
+// inside its own transaction, so the switch never outlives it. Batches release
+// the writer in between, letting queued inserts through.
 func (s *SQLiteStore) DeleteBefore(ctx context.Context, cutoff time.Time) (int64, error) {
 	if s == nil || s.db == nil {
 		return 0, nil
 	}
-	res, err := s.db.ExecContext(ctx, "DELETE FROM usage_records WHERE timestamp < ?", formatTimestamp(cutoff))
+	var total int64
+	for {
+		deleted, err := s.deleteBatchBefore(ctx, formatTimestamp(cutoff))
+		total += deleted
+		if err != nil || deleted < cleanupBatchSize {
+			return total, err
+		}
+	}
+}
+
+func (s *SQLiteStore) deleteBatchBefore(ctx context.Context, cutoff string) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("usage sqlite delete before begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `UPDATE usage_rollup_control SET keep_on_delete = 1 WHERE id = 1`); err != nil {
+		return 0, fmt.Errorf("usage sqlite delete before keep rollups: %w", err)
+	}
+	res, err := tx.ExecContext(ctx,
+		`DELETE FROM usage_records WHERE rowid IN (SELECT rowid FROM usage_records WHERE timestamp < ? ORDER BY timestamp LIMIT ?)`,
+		cutoff, cleanupBatchSize)
 	if err != nil {
 		return 0, fmt.Errorf("usage sqlite delete before: %w", err)
 	}
-	rows, err := res.RowsAffected()
+	deleted, err := res.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("usage sqlite rows affected: %w", err)
 	}
-	return rows, nil
+	if _, err := tx.ExecContext(ctx, `UPDATE usage_rollup_control SET keep_on_delete = 0 WHERE id = 1`); err != nil {
+		return 0, fmt.Errorf("usage sqlite delete before restore: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("usage sqlite delete before commit: %w", err)
+	}
+	return deleted, nil
 }
 
-// Close closes the underlying database.
+// Close closes the readers, then the writer, each only after its in-flight
+// work has finished, so this instance holds no file descriptor on usage.db
+// when Close returns (two SQLite copies in one process must never overlap).
+// The writer closes last and checkpoints the WAL back into usage.db.
 func (s *SQLiteStore) Close() error {
 	if s == nil || s.db == nil {
 		return nil
 	}
-	// db.Close closes only idle connections: a running statement, tx or open
-	// rows would keep writing usage.db after it returns. With MaxOpenConns(1),
-	// taking the connection first waits for that work to finish.
+	var errRead error
+	if s.rdb != nil {
+		errRead = closeWhenIdle(s.rdb, readPoolSize)
+	}
+	return errors.Join(errRead, closeWhenIdle(s.db, 1))
+}
+
+// closeWhenIdle closes db after its running work. db.Close closes only idle
+// connections: a running statement, tx or open rows would keep using usage.db
+// after it returns. Taking every connection first waits for that work.
+func closeWhenIdle(db *sql.DB, conns int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), insertTimeout)
 	defer cancel()
-	conn, errConn := s.db.Conn(ctx)
-	errClose := s.db.Close()
-	if errConn == nil {
+	held := make([]*sql.Conn, 0, conns)
+	for range conns {
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			break
+		}
+		held = append(held, conn)
+	}
+	errClose := db.Close()
+	for _, conn := range held {
 		// The db is closed, so releasing the conn closes the driver connection.
 		_ = conn.Close()
 	}

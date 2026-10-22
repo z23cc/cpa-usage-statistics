@@ -2,7 +2,7 @@
 
 CLIProxyAPI 的持久化用量统计插件。记录每次请求的用量，写入本地 SQLite；提供查询/删除接口。字段命名对齐上游 `usage.Record` / `usage.Detail`。
 
-当前版本：`0.4.0-acct.1`（在 `0.1.0` 基础上增加按账号汇总、按账号分页明细、单价与花费，以及面板侧边栏里的"账号用量"页面，含分页的账号列表和账号详情）
+当前版本：`0.5.0-acct.1`（在 `0.1.0` 基础上增加按账号汇总、按账号分页明细、单价与花费、面板侧边栏里的"账号用量"页面，以及小时 / 天汇总表和 WAL 读写分离）
 
 ## 建议使用配套的前端面板
 
@@ -37,11 +37,29 @@ plugins:
       priority: 100
       # 可选：usage.db 存放目录；缺省为 ~/.cli-proxy-api/plugins/usage-statistics
       data_dir: ""
-      # 可选：保留天数，超过则清理旧记录；0 表示不清理
+      # 可选：逐条明细的保留天数，超过的明细在后台分批清理；小时/天汇总不清理；0 表示不清理
       retention_days: 0
 ```
 
 `data_dir` 也可用环境变量 `USAGE_STATISTICS_DIR` 指定。中文配置键 `用量保留天数`、`数据目录` 同样可用。
+
+## 存储
+
+`usage.db` 是 WAL 模式的 SQLite（`synchronous=NORMAL`）。插件用一条写连接和一个 4 连接的只读连接池，读和写互不阻塞。
+
+| 表 | 内容 | 保留 |
+| --- | --- | --- |
+| `usage_records` | 每个请求一行的明细 | `retention_days` |
+| `usage_hourly` / `usage_daily` | 按 UTC 小时 / 天 × 账号（`auth_index` + `auth_id`）× 模型汇总的请求数、失败数、各类 token、首末请求时间 | 永久 |
+| `model_prices` | 单价 | 永久 |
+
+- **汇总表由触发器维护：** 写入明细时累加；按 id 删除明细时扣减；`retention_days` 清理时不扣减。
+- **账号汇总的算法：** 整天读天表，零头整小时读小时表，两端不足一小时的部分读明细。所以耗时和明细总量无关。
+- **超过明细保留期的时间段：** 汇总照样能查，但起点会对齐到整点。
+- **从 0.4.0 及以前升级：** 第一次启动时，会在一个事务里切到 WAL、建汇总表和触发器，并从已有明细回填（`PRAGMA user_version = 1`）。
+- **回滚到旧版本：** 旧版本能照常打开数据库，触发器仍会维护汇总。回滚前请先删掉 `retention_days`，因为旧版本的清理会顺带扣减汇总。
+
+**备份：** WAL 模式下，数据可能还在 `usage.db-wal` 里。在线备份请用 SQLite 备份 API，例如 `python3 -c "import sqlite3; s=sqlite3.connect('usage.db'); d=sqlite3.connect('backup.db'); s.backup(d)"`，不要直接 `cp` 一个正在使用的库。不要手动删除 `-wal` 和 `-shm` 文件。
 
 ## API
 
@@ -132,7 +150,9 @@ GET /v0/management/plugins/usage-statistics/accounts?start=<RFC3339>&end=<RFC333
 
 `cost_usd` 只计已设单价的模型；没设单价的模型列在 `unpriced_models` 里。`models` 是该账号按模型拆分的用量，按 `total_tokens` 降序；没设单价的模型 `cost_usd` 为 `null`。
 
-`total_tokens` 是该账号所有记录 `total_tokens` 之和（缓存计入输入、推理计入输出，不要再相加）。汇总要扫描范围内所有记录（约 1 秒 / 50 万条），数据量大时请带 `start`/`end` 或配置 `retention_days`。
+`total_tokens` 是该账号所有记录 `total_tokens` 之和（缓存计入输入、推理计入输出，不要再相加）。汇总从小时 / 天汇总表计算，只有两端不足一小时的部分读明细，详见"存储"一节。
+
+响应顶层的 `details_since` 是最早一条保留明细的时间（没有明细时为 `null`）。所选范围早于它的部分只有汇总，起点对齐到整点。
 
 ### 按账号分页明细
 
@@ -167,7 +187,7 @@ Content-Type: application/json
 {"prices": [{"model": "muse-wonder-full-1.0", "input": 5, "output": 25, "cache_read": 0.2, "cache_creation": 0}]}
 ```
 
-- 单位是美元 / 百万 token，与配套面板相同。`GET` 另外返回 `models_seen`，即记录里出现过的模型。
+- 单位是美元 / 百万 token，与配套面板相同。`GET` 另外返回 `models_seen`，即出现过用量的模型，从天汇总表读取，所以明细已清理的模型也会列出。
 - `PUT` 整体替换单价表，传 `[]` 表示清空；请求体缺少 `prices` 键时返回 400，防止误清空。每个价须在 0–10000 之间，最多 500 个模型。
 - `PUT` 只接受 `{"prices": [...]}`，出现未知字段（例如面板里的 `cacheRead` 写法，或 `GET` 返回的 `models_seen`）一律返回 400，避免字段名写错时被当成 0 存进去。
 - 单价存在 `usage.db` 的 `model_prices` 表里。旧版本插件会忽略这张表，回滚后照样能打开数据库。
