@@ -75,3 +75,51 @@ type DeleteResult struct {
 	Deleted int64    `json:"deleted"`
 	Missing []string `json:"missing"`
 }
+
+// AccountUsage is the per-credential aggregate returned by the accounts API.
+// Accounts are keyed by auth_index (stable per credential file) plus auth_id.
+type AccountUsage struct {
+	AuthIndex      string     `json:"auth_index"`
+	AuthID         string     `json:"auth_id"`
+	Source         string     `json:"source"`
+	Provider       string     `json:"provider"`
+	AuthType       string     `json:"auth_type"`
+	Requests       int64      `json:"requests"`
+	Success        int64      `json:"success"`
+	Failed         int64      `json:"failed"`
+	Tokens         TokenStats `json:"tokens"`
+	FirstRequestAt time.Time  `json:"first_request_at"`
+	LastRequestAt  time.Time  `json:"last_request_at"`
+}
+
+// UsageTotals sums every account in an accounts response.
+type UsageTotals struct {
+	Accounts int        `json:"accounts"`
+	Requests int64      `json:"requests"`
+	Success  int64      `json:"success"`
+	Failed   int64      `json:"failed"`
+	Tokens   TokenStats `json:"tokens"`
+}
+
+// AccountsResponse is the body of GET /plugins/usage-statistics/accounts.
+type AccountsResponse struct {
+	Accounts []AccountUsage `json:"accounts"`
+	Totals   UsageTotals    `json:"totals"`
+}
+
+// RecordsQuery selects one page of records, newest first.
+type RecordsQuery struct {
+	Range     QueryRange
+	AuthIndex string
+	AuthID    string
+	Limit     int
+	// Cursor is the opaque next_cursor of the previous page; empty for the first page.
+	Cursor string
+}
+
+// RecordsPage is the body of GET /plugins/usage-statistics/records.
+// NextCursor is null on the last page.
+type RecordsPage struct {
+	Records    []RequestDetail `json:"records"`
+	NextCursor *string         `json:"next_cursor"`
+}

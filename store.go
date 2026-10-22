@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +15,19 @@ import (
 )
 
 const sqliteTimestampLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
+// sqliteBusyTimeoutPragma makes a database locked by another process wait
+// instead of failing at once with SQLITE_BUSY (the driver default is 0).
+const sqliteBusyTimeoutPragma = "?_pragma=busy_timeout(3000)"
+
+// recordColumns is the column list scanned by scanRequestDetail, in order.
+const recordColumns = `id, timestamp, api_key, provider, model, alias, source, auth_id, auth_index, auth_type, executor_type,
+       reasoning_effort, service_tier, latency_ms, ttft_ms,
+       input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens, total_tokens,
+       failed, failure_status_code, failure_body`
+
+// errInvalidCursor reports a records cursor that was not produced by this plugin.
+var errInvalidCursor = errors.New("invalid cursor")
 
 // SQLiteStore persists usage records in a pure-Go SQLite database.
 type SQLiteStore struct {
@@ -27,7 +42,7 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 	if err := prepareSQLitePath(path); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", path+sqliteBusyTimeoutPragma)
 	if err != nil {
 		return nil, fmt.Errorf("usage sqlite open: %w", err)
 	}
@@ -96,7 +111,15 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 			return fmt.Errorf("usage sqlite init schema: %w", err)
 		}
 	}
-	return s.migrateSchema(ctx)
+	if err := s.migrateSchema(ctx); err != nil {
+		return err
+	}
+	// Backs per-account paging. Created after migrateSchema because older dbs may
+	// lack auth_index. Index only, no new columns, so v0.1.0 can still open the db.
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_usage_records_auth_ts ON usage_records(auth_index, timestamp, id)`); err != nil {
+		return fmt.Errorf("usage sqlite init schema: %w", err)
+	}
+	return nil
 }
 
 // migrateSchema 让老版本 db 的字段自愈到最新：用 table_info 读出现有列，
@@ -230,22 +253,8 @@ func (s *SQLiteStore) Query(ctx context.Context, rng QueryRange) (APIUsage, erro
 	if s == nil || s.db == nil {
 		return APIUsage{}, nil
 	}
-	query := `
-SELECT id, timestamp, api_key, provider, model, alias, source, auth_id, auth_index, auth_type, executor_type,
-       reasoning_effort, service_tier, latency_ms, ttft_ms,
-       input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens, total_tokens,
-       failed, failure_status_code, failure_body
-FROM usage_records`
-	args := make([]any, 0, 2)
-	where := make([]string, 0, 2)
-	if rng.Start != nil && !rng.Start.IsZero() {
-		where = append(where, "timestamp >= ?")
-		args = append(args, formatTimestamp(*rng.Start))
-	}
-	if rng.End != nil && !rng.End.IsZero() {
-		where = append(where, "timestamp < ?")
-		args = append(args, formatTimestamp(*rng.End))
-	}
+	where, args := rangeWhere(rng)
+	query := "SELECT " + recordColumns + " FROM usage_records"
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
@@ -259,48 +268,10 @@ FROM usage_records`
 
 	result := APIUsage{}
 	for rows.Next() {
-		var timestampText string
-		var apiKey string
-		var failedInt int
-		detail := RequestDetail{}
-		if err := rows.Scan(
-			&detail.ID,
-			&timestampText,
-			&apiKey,
-			&detail.Provider,
-			&detail.Model,
-			&detail.Alias,
-			&detail.Source,
-			&detail.AuthID,
-			&detail.AuthIndex,
-			&detail.AuthType,
-			&detail.ExecutorType,
-			&detail.ReasoningEffort,
-			&detail.ServiceTier,
-			&detail.LatencyMs,
-			&detail.TTFTMs,
-			&detail.Tokens.InputTokens,
-			&detail.Tokens.OutputTokens,
-			&detail.Tokens.ReasoningTokens,
-			&detail.Tokens.CachedTokens,
-			&detail.Tokens.CacheReadTokens,
-			&detail.Tokens.CacheCreationTokens,
-			&detail.Tokens.TotalTokens,
-			&failedInt,
-			&detail.FailureStatusCode,
-			&detail.FailureBody,
-		); err != nil {
-			return nil, fmt.Errorf("usage sqlite scan: %w", err)
-		}
-		parsed, err := time.Parse(time.RFC3339Nano, timestampText)
+		detail, apiKey, _, err := scanRequestDetail(rows)
 		if err != nil {
-			return nil, fmt.Errorf("usage sqlite parse timestamp: %w", err)
+			return nil, err
 		}
-		detail.Timestamp = parsed.UTC()
-		detail.LatencyMs = nonNegative(detail.LatencyMs)
-		detail.TTFTMs = nonNegative(detail.TTFTMs)
-		detail.Failed = failedInt != 0
-
 		key := groupingKey(apiKey, detail.Provider)
 		modelKey := normalizeModel(detail.Model)
 		if result[key] == nil {
@@ -312,6 +283,246 @@ FROM usage_records`
 		return nil, fmt.Errorf("usage sqlite rows: %w", err)
 	}
 	return result, nil
+}
+
+// AccountSummary aggregates usage per credential (auth_index + auth_id) within
+// rng, ordered by total tokens descending.
+// ponytail: scans every row in rng (~1 s per 500k rows) while holding the only
+// connection, so concurrent inserts wait; pass start/end or set retention_days,
+// add a daily rollup table if unbounded queries over millions of rows are needed.
+func (s *SQLiteStore) AccountSummary(ctx context.Context, rng QueryRange) (AccountsResponse, error) {
+	result := AccountsResponse{Accounts: []AccountUsage{}}
+	if s == nil || s.db == nil {
+		return result, nil
+	}
+	where, args := rangeWhere(rng)
+	query := `
+SELECT auth_index, auth_id, MAX(source), MAX(provider), MAX(auth_type),
+       COUNT(*), SUM(failed),
+       SUM(input_tokens), SUM(output_tokens), SUM(reasoning_tokens), SUM(cached_tokens),
+       SUM(cache_read_tokens), SUM(cache_creation_tokens), SUM(total_tokens),
+       MIN(timestamp), MAX(timestamp)
+FROM usage_records`
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " GROUP BY auth_index, auth_id ORDER BY SUM(total_tokens) DESC, auth_id ASC, auth_index ASC"
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return result, fmt.Errorf("usage sqlite account summary: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var account AccountUsage
+		var firstText, lastText string
+		if err := rows.Scan(
+			&account.AuthIndex,
+			&account.AuthID,
+			&account.Source,
+			&account.Provider,
+			&account.AuthType,
+			&account.Requests,
+			&account.Failed,
+			&account.Tokens.InputTokens,
+			&account.Tokens.OutputTokens,
+			&account.Tokens.ReasoningTokens,
+			&account.Tokens.CachedTokens,
+			&account.Tokens.CacheReadTokens,
+			&account.Tokens.CacheCreationTokens,
+			&account.Tokens.TotalTokens,
+			&firstText,
+			&lastText,
+		); err != nil {
+			return result, fmt.Errorf("usage sqlite account summary scan: %w", err)
+		}
+		account.Success = account.Requests - account.Failed
+		if account.FirstRequestAt, err = parseStoredTimestamp(firstText); err != nil {
+			return result, err
+		}
+		if account.LastRequestAt, err = parseStoredTimestamp(lastText); err != nil {
+			return result, err
+		}
+		result.Accounts = append(result.Accounts, account)
+		addTotals(&result.Totals, account)
+	}
+	if err := rows.Err(); err != nil {
+		return result, fmt.Errorf("usage sqlite account summary rows: %w", err)
+	}
+	result.Totals.Accounts = len(result.Accounts)
+	return result, nil
+}
+
+// ListRecords returns one page of records newest first, optionally filtered by
+// credential. The cursor is a (timestamp, id) keyset: fine for browsing, but a
+// long request is written after rows that started later, so it is not a safe
+// watermark for incremental sync.
+func (s *SQLiteStore) ListRecords(ctx context.Context, q RecordsQuery) (RecordsPage, error) {
+	page := RecordsPage{Records: []RequestDetail{}}
+	if s == nil || s.db == nil {
+		return page, nil
+	}
+	if q.Limit <= 0 {
+		return page, fmt.Errorf("usage sqlite list records: limit must be positive")
+	}
+	where, args := rangeWhere(q.Range)
+	if q.AuthIndex != "" {
+		where = append(where, "auth_index = ?")
+		args = append(args, q.AuthIndex)
+	}
+	if q.AuthID != "" {
+		where = append(where, "auth_id = ?")
+		args = append(args, q.AuthID)
+	}
+	if q.Cursor != "" {
+		cursorTimestamp, cursorID, err := decodeRecordsCursor(q.Cursor)
+		if err != nil {
+			return page, err
+		}
+		// Row-value form keeps the index range scan; the equivalent OR form makes
+		// SQLite collect and sort every older row. Both columns are NOT NULL.
+		where = append(where, "(timestamp, id) < (?, ?)")
+		args = append(args, cursorTimestamp, cursorID)
+	}
+	query := "SELECT " + recordColumns + " FROM usage_records"
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	// Fetch one extra row to learn whether another page exists.
+	query += " ORDER BY timestamp DESC, id DESC LIMIT ?"
+	args = append(args, q.Limit+1)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return page, fmt.Errorf("usage sqlite list records: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var lastTimestampText string
+	for rows.Next() {
+		detail, _, timestampText, err := scanRequestDetail(rows)
+		if err != nil {
+			return page, err
+		}
+		if len(page.Records) == q.Limit {
+			next := encodeRecordsCursor(lastTimestampText, page.Records[len(page.Records)-1].ID)
+			page.NextCursor = &next
+			break
+		}
+		page.Records = append(page.Records, detail)
+		lastTimestampText = timestampText
+	}
+	if err := rows.Err(); err != nil {
+		return page, fmt.Errorf("usage sqlite list records rows: %w", err)
+	}
+	return page, nil
+}
+
+// rangeWhere turns a QueryRange into SQL conditions on the timestamp column.
+func rangeWhere(rng QueryRange) ([]string, []any) {
+	where := make([]string, 0, 2)
+	args := make([]any, 0, 2)
+	if rng.Start != nil && !rng.Start.IsZero() {
+		where = append(where, "timestamp >= ?")
+		args = append(args, formatTimestamp(*rng.Start))
+	}
+	if rng.End != nil && !rng.End.IsZero() {
+		where = append(where, "timestamp < ?")
+		args = append(args, formatTimestamp(*rng.End))
+	}
+	return where, args
+}
+
+// scanRequestDetail scans one row selected with recordColumns. It also returns
+// the api_key (not part of RequestDetail) and the raw stored timestamp text.
+func scanRequestDetail(rows *sql.Rows) (RequestDetail, string, string, error) {
+	var timestampText string
+	var apiKey string
+	var failedInt int
+	detail := RequestDetail{}
+	if err := rows.Scan(
+		&detail.ID,
+		&timestampText,
+		&apiKey,
+		&detail.Provider,
+		&detail.Model,
+		&detail.Alias,
+		&detail.Source,
+		&detail.AuthID,
+		&detail.AuthIndex,
+		&detail.AuthType,
+		&detail.ExecutorType,
+		&detail.ReasoningEffort,
+		&detail.ServiceTier,
+		&detail.LatencyMs,
+		&detail.TTFTMs,
+		&detail.Tokens.InputTokens,
+		&detail.Tokens.OutputTokens,
+		&detail.Tokens.ReasoningTokens,
+		&detail.Tokens.CachedTokens,
+		&detail.Tokens.CacheReadTokens,
+		&detail.Tokens.CacheCreationTokens,
+		&detail.Tokens.TotalTokens,
+		&failedInt,
+		&detail.FailureStatusCode,
+		&detail.FailureBody,
+	); err != nil {
+		return detail, "", "", fmt.Errorf("usage sqlite scan: %w", err)
+	}
+	parsed, err := parseStoredTimestamp(timestampText)
+	if err != nil {
+		return detail, "", "", err
+	}
+	detail.Timestamp = parsed
+	detail.LatencyMs = nonNegative(detail.LatencyMs)
+	detail.TTFTMs = nonNegative(detail.TTFTMs)
+	detail.Failed = failedInt != 0
+	return detail, apiKey, timestampText, nil
+}
+
+func parseStoredTimestamp(text string) (time.Time, error) {
+	parsed, err := time.Parse(time.RFC3339Nano, text)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("usage sqlite parse timestamp: %w", err)
+	}
+	return parsed.UTC(), nil
+}
+
+func addTotals(totals *UsageTotals, account AccountUsage) {
+	totals.Requests += account.Requests
+	totals.Success += account.Success
+	totals.Failed += account.Failed
+	totals.Tokens.InputTokens += account.Tokens.InputTokens
+	totals.Tokens.OutputTokens += account.Tokens.OutputTokens
+	totals.Tokens.ReasoningTokens += account.Tokens.ReasoningTokens
+	totals.Tokens.CachedTokens += account.Tokens.CachedTokens
+	totals.Tokens.CacheReadTokens += account.Tokens.CacheReadTokens
+	totals.Tokens.CacheCreationTokens += account.Tokens.CacheCreationTokens
+	totals.Tokens.TotalTokens += account.Tokens.TotalTokens
+}
+
+// encodeRecordsCursor packs the last row's stored timestamp text and id.
+func encodeRecordsCursor(timestampText, id string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(timestampText + "|" + id))
+}
+
+func decodeRecordsCursor(cursor string) (string, string, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		return "", "", errInvalidCursor
+	}
+	timestampText, id, ok := strings.Cut(string(raw), "|")
+	if !ok || id == "" {
+		return "", "", errInvalidCursor
+	}
+	// Reject anything that is not in the exact stored form (e.g. a +08:00 offset),
+	// since cursors are compared to stored timestamps as text.
+	parsed, err := time.Parse(sqliteTimestampLayout, timestampText)
+	if err != nil || formatTimestamp(parsed) != timestampText {
+		return "", "", errInvalidCursor
+	}
+	return timestampText, id, nil
 }
 
 // Delete removes records by id and reports which ids were absent.

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,16 +18,24 @@ const (
 	abiVersion uint32 = 1
 	pluginID          = "usage-statistics"
 	pluginName        = "Usage Statistics"
-	// managementUsagePath is the plugin-owned management route path. The host
-	// mounts it under /v0/management, producing
-	// /v0/management/plugins/usage-statistics/usage.
-	managementUsagePath = "/plugins/" + pluginID + "/usage"
-	insertTimeout       = 5 * time.Second
+	// Plugin-owned management route paths. The host mounts them under
+	// /v0/management, producing e.g. /v0/management/plugins/usage-statistics/usage.
+	managementUsagePath    = "/plugins/" + pluginID + "/usage"
+	managementAccountsPath = "/plugins/" + pluginID + "/accounts"
+	managementRecordsPath  = "/plugins/" + pluginID + "/records"
+	// insertTimeout is long because the host drops a record whose usage.handle
+	// fails and never retries; its queue is unbounded, so waiting behind a read
+	// on the single connection only delays the record.
+	insertTimeout = 30 * time.Second
+	queryTimeout  = 5 * time.Second
+
+	defaultRecordsLimit = 100
+	maxRecordsLimit     = 1000
 )
 
 // Overridable at build time via -ldflags "-X main.pluginVersion=...".
 var (
-	pluginVersion    = "0.1.0"
+	pluginVersion    = "0.2.0-acct.1"
 	pluginAuthor     = "Fwindy"
 	pluginRepository = "https://github.com/Fwindy/cpa-usage-statistics"
 )
@@ -139,6 +148,8 @@ func managementRegistration() managementRegistrationPayload {
 		Routes: []managementRoute{
 			{Method: "GET", Path: managementUsagePath, Description: "Query persisted usage grouped by api key and model."},
 			{Method: "DELETE", Path: managementUsagePath, Description: "Delete persisted usage records by id."},
+			{Method: "GET", Path: managementAccountsPath, Description: "Aggregate persisted usage per credential."},
+			{Method: "GET", Path: managementRecordsPath, Description: "Page persisted usage records newest first, optionally for one credential."},
 		},
 	}
 }
@@ -271,7 +282,21 @@ func handleManagement(request []byte) ([]byte, error) {
 			return nil, err
 		}
 	}
-	switch strings.ToUpper(strings.TrimSpace(req.Method)) {
+	method := strings.ToUpper(strings.TrimSpace(req.Method))
+	// The host passes the full request path (/v0/management/plugins/...).
+	switch {
+	case strings.HasSuffix(req.Path, managementAccountsPath):
+		if method != "GET" {
+			return okEnvelope(jsonManagementResponse(405, map[string]string{"error": "method not allowed"}))
+		}
+		return accountsGet(req)
+	case strings.HasSuffix(req.Path, managementRecordsPath):
+		if method != "GET" {
+			return okEnvelope(jsonManagementResponse(405, map[string]string{"error": "method not allowed"}))
+		}
+		return recordsGet(req)
+	}
+	switch method {
 	case "GET":
 		return usageGet(req)
 	case "DELETE":
@@ -279,6 +304,60 @@ func handleManagement(request []byte) ([]byte, error) {
 	default:
 		return okEnvelope(jsonManagementResponse(405, map[string]string{"error": "method not allowed"}))
 	}
+}
+
+func accountsGet(req managementRequest) ([]byte, error) {
+	rng, errResp := parseUsageRange(req.Query)
+	if errResp != nil {
+		return okEnvelope(*errResp)
+	}
+	store := currentStore()
+	if store == nil {
+		return okEnvelope(jsonManagementResponse(200, AccountsResponse{Accounts: []AccountUsage{}}))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+	result, err := store.AccountSummary(ctx, rng)
+	if err != nil {
+		return okEnvelope(jsonManagementResponse(500, map[string]string{"error": "failed to query account usage"}))
+	}
+	return okEnvelope(jsonManagementResponse(200, result))
+}
+
+func recordsGet(req managementRequest) ([]byte, error) {
+	rng, errResp := parseUsageRange(req.Query)
+	if errResp != nil {
+		return okEnvelope(*errResp)
+	}
+	limit := defaultRecordsLimit
+	if raw := strings.TrimSpace(firstValue(req.Query, "limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			return okEnvelope(jsonManagementResponse(400, map[string]string{"error": "invalid limit"}))
+		}
+		limit = min(parsed, maxRecordsLimit)
+	}
+	q := RecordsQuery{
+		Range:     rng,
+		AuthIndex: strings.TrimSpace(firstValue(req.Query, "auth_index")),
+		AuthID:    strings.TrimSpace(firstValue(req.Query, "auth_id")),
+		Limit:     limit,
+		Cursor:    strings.TrimSpace(firstValue(req.Query, "cursor")),
+	}
+	store := currentStore()
+	if store == nil {
+		return okEnvelope(jsonManagementResponse(200, RecordsPage{Records: []RequestDetail{}}))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+	page, err := store.ListRecords(ctx, q)
+	if errors.Is(err, errInvalidCursor) {
+		return okEnvelope(jsonManagementResponse(400, map[string]string{"error": "invalid cursor"}))
+	}
+	if err != nil {
+		return okEnvelope(jsonManagementResponse(500, map[string]string{"error": "failed to query usage records"}))
+	}
+	return okEnvelope(jsonManagementResponse(200, page))
 }
 
 func usageGet(req managementRequest) ([]byte, error) {
@@ -290,7 +369,7 @@ func usageGet(req managementRequest) ([]byte, error) {
 	if store == nil {
 		return okEnvelope(jsonManagementResponse(200, APIUsage{}))
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), insertTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
 	defer cancel()
 	result, err := store.Query(ctx, rng)
 	if err != nil {
@@ -326,7 +405,7 @@ func usageDelete(req managementRequest) ([]byte, error) {
 	if len(ids) == 0 {
 		return okEnvelope(jsonManagementResponse(400, map[string]string{"error": "ids required"}))
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), insertTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
 	defer cancel()
 	result, err := store.Delete(ctx, ids)
 	if err != nil {
