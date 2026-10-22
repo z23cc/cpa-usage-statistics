@@ -362,20 +362,30 @@ FROM usage_records`
 		if group.LastRequestAt, err = parseStoredTimestamp(lastText); err != nil {
 			return result, err
 		}
+		// Taken before merging: the first group becomes the account itself.
+		modelUsage := ModelUsage{
+			Model: model, Requests: group.Requests, Success: group.Requests - group.Failed,
+			Failed: group.Failed, Tokens: group.Tokens,
+		}
 		key := accountKey{group.AuthIndex, group.AuthID}
 		account, ok := accounts[key]
 		if !ok {
 			group.UnpricedModels = []string{}
+			group.Models = []ModelUsage{}
 			account = &group
 			accounts[key] = account
 		} else {
 			mergeAccountGroup(account, group)
 		}
 		if price, ok := s.priceFor(model); ok {
-			account.CostUSD += costUSD(price, pureInput, group.Tokens.CachedTokens, group.Tokens.CacheCreationTokens, group.Tokens.OutputTokens)
+			cost := costUSD(price, pureInput, group.Tokens.CachedTokens, group.Tokens.CacheCreationTokens, group.Tokens.OutputTokens)
+			account.CostUSD += cost
+			rounded := roundUSD(cost)
+			modelUsage.CostUSD = &rounded
 		} else {
 			account.UnpricedModels = append(account.UnpricedModels, model)
 		}
+		account.Models = append(account.Models, modelUsage)
 	}
 	if err := rows.Err(); err != nil {
 		return result, fmt.Errorf("usage sqlite account summary rows: %w", err)
@@ -385,6 +395,13 @@ FROM usage_records`
 		account.Success = account.Requests - account.Failed
 		account.CostUSD = roundUSD(account.CostUSD)
 		sort.Strings(account.UnpricedModels)
+		sort.Slice(account.Models, func(i, j int) bool {
+			a, b := account.Models[i], account.Models[j]
+			if a.Tokens.TotalTokens != b.Tokens.TotalTokens {
+				return a.Tokens.TotalTokens > b.Tokens.TotalTokens
+			}
+			return a.Model < b.Model
+		})
 		result.Accounts = append(result.Accounts, *account)
 	}
 	sort.Slice(result.Accounts, func(i, j int) bool {
@@ -434,11 +451,16 @@ func (s *SQLiteStore) recordCost(detail RequestDetail) *float64 {
 }
 
 // ListRecords returns one page of records newest first, optionally filtered by
-// credential. The cursor is a (timestamp, id) keyset: fine for browsing, but a
-// long request is written after rows that started later, so it is not a safe
-// watermark for incremental sync.
+// credential, model and result. The cursor is a (timestamp, id) keyset: fine
+// for browsing, but a long request is written after rows that started later,
+// so it is not a safe watermark for incremental sync. Numbered paging (q.Page)
+// uses OFFSET and also counts the matching records.
 func (s *SQLiteStore) ListRecords(ctx context.Context, q RecordsQuery) (RecordsPage, error) {
 	page := RecordsPage{Records: []RecordDetail{}}
+	if q.Page > 0 {
+		var zero int64
+		page.Total = &zero
+	}
 	if s == nil || s.db == nil {
 		return page, nil
 	}
@@ -453,6 +475,29 @@ func (s *SQLiteStore) ListRecords(ctx context.Context, q RecordsQuery) (RecordsP
 	if q.AuthID != "" {
 		where = append(where, "auth_id = ?")
 		args = append(args, q.AuthID)
+	}
+	if q.Model != "" {
+		where = append(where, "model = ?")
+		args = append(args, q.Model)
+	}
+	if q.Failed != nil {
+		where = append(where, "failed = ?")
+		args = append(args, boolToInt(*q.Failed))
+	}
+	offset := 0
+	if q.Page > 0 {
+		countQuery := "SELECT COUNT(*) FROM usage_records"
+		if len(where) > 0 {
+			countQuery += " WHERE " + strings.Join(where, " AND ")
+		}
+		if err := s.db.QueryRowContext(ctx, countQuery, args...).Scan(page.Total); err != nil {
+			return page, fmt.Errorf("usage sqlite count records: %w", err)
+		}
+		offset = (q.Page - 1) * q.Limit
+		// Past the end: skip the page query, which would walk every match.
+		if int64(offset) >= *page.Total {
+			return page, nil
+		}
 	}
 	if q.Cursor != "" {
 		cursorTimestamp, cursorID, err := decodeRecordsCursor(q.Cursor)
@@ -469,8 +514,8 @@ func (s *SQLiteStore) ListRecords(ctx context.Context, q RecordsQuery) (RecordsP
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
 	// Fetch one extra row to learn whether another page exists.
-	query += " ORDER BY timestamp DESC, id DESC LIMIT ?"
-	args = append(args, q.Limit+1)
+	query += " ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?"
+	args = append(args, q.Limit+1, offset)
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {

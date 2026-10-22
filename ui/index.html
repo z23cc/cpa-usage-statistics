@@ -77,8 +77,10 @@
   .banner { display: none; margin: 8px 16px 0; padding: 8px 12px; border-radius: 8px; background: var(--bad-bg); color: var(--bad-text); border: 1px solid var(--bad-border); }
   .banner.on { display: flex; align-items: center; gap: 8px; }
 
-  .main { flex: 1; min-height: 0; display: flex; padding: 8px 16px 12px; gap: 12px; position: relative; }
-  .table-wrap { flex: 1; min-width: 0; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--raised); }
+  [hidden] { display: none !important; }
+  /* Each view scrolls as a whole, so sticky table headers stick to its top. */
+  .view { flex: 1; min-height: 0; overflow: auto; padding-bottom: 12px; }
+  .panel { margin: 8px 16px 0; border: 1px solid var(--border); border-radius: 8px; background: var(--raised); }
   table { width: 100%; border-collapse: collapse; }
   th, td { padding: 7px 8px; border-bottom: 1px solid var(--border); text-align: right; white-space: nowrap; }
   th:first-child, td:first-child, th.left, td.left { text-align: left; }
@@ -90,6 +92,7 @@
   tbody tr.row:hover { background: var(--surface-2); }
   tbody tr.row[aria-selected="true"] { background: var(--selected); }
   tbody tr.idle td { color: var(--text-3); }
+  table.loading tbody { opacity: 0.5; }
   .acct { display: flex; flex-direction: column; max-width: 260px; }
   .acct span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .acct .file { color: var(--text-3); font-size: 11px; }
@@ -98,24 +101,29 @@
   .badge.warn { background: var(--warn-bg); color: var(--warn-text); border-color: var(--warn-border); }
   .badge.bad { background: var(--bad-bg); color: var(--bad-text); border-color: var(--bad-border); }
   .badge.muted { background: var(--muted-bg); color: var(--muted-text); border-color: var(--muted-border); }
-  .table-foot { padding: 6px 10px; color: var(--text-3); }
+  .table-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 8px 10px; color: var(--text-3); }
   .empty { padding: 32px; text-align: center; color: var(--text-3); }
 
-  /* The drawer floats over the right of the table so the table keeps its width. */
-  .drawer { position: absolute; top: 8px; right: 16px; bottom: 12px; width: min(640px, 64%); z-index: 3; display: none; flex-direction: column; min-height: 0; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--raised); box-shadow: var(--shadow); }
-  .drawer.on { display: flex; }
-  .drawer-head { padding: 10px 12px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; align-items: flex-start; }
-  .drawer-head .title { font-weight: 600; word-break: break-all; }
-  .drawer-head .meta { color: var(--text-2); font-size: 12px; margin-top: 2px; word-break: break-all; }
-  .drawer-sum { display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 8px 12px; border-bottom: 1px solid var(--border); color: var(--text-2); }
-  .drawer-sum b { color: var(--text); font-weight: 600; }
-  .drawer-body { flex: 1; min-height: 0; overflow: auto; }
-  .drawer-body th, .drawer-body td { padding: 6px 8px; font-size: 12px; }
+  .pager { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-left: auto; color: var(--text-2); }
+  .pager .pg { min-width: 30px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--surface); padding: 2px 8px; }
+  .pager .pg:hover:not(:disabled) { background: var(--surface-2); }
+  .pager .pg[aria-current="page"] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+  .pager .pg:disabled { opacity: 0.45; cursor: default; }
+  .pager .gap { padding: 0 2px; color: var(--text-3); }
+  .pager select, .pager input { padding: 2px 6px; }
+  .pager input { width: 64px; }
+
+  .acct-head { display: flex; align-items: flex-start; gap: 12px; padding: 12px 16px 0; }
+  .acct-head .title { font-size: 15px; font-weight: 600; word-break: break-all; }
+  .acct-head .meta { color: var(--text-2); font-size: 12px; margin-top: 2px; word-break: break-all; }
+  .sec-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 16px 16px 0; }
+  .sec-row h2 { font-size: 14px; margin: 0 8px 0 0; font-weight: 600; }
+  .notice { margin: 12px 16px 0; padding: 24px; text-align: center; color: var(--text-2); border: 1px dashed var(--border-strong); border-radius: 8px; }
+  #recTable th, #recTable td { padding: 6px 8px; font-size: 12px; }
   tr.fail td.res { color: var(--bad-text); }
   tr.fail { cursor: pointer; }
   tr.detail td { white-space: normal; text-align: left; background: var(--surface); }
   pre.body { margin: 0; max-height: 240px; overflow: auto; white-space: pre-wrap; word-break: break-all; font: 12px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
-  .sentinel { padding: 10px; text-align: center; color: var(--text-3); }
   .x { border: 0; background: none; font-size: 18px; line-height: 1; padding: 0 4px; color: var(--text-2); }
 
   .gate { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: color-mix(in srgb, var(--bg) 88%, transparent); z-index: 10; }
@@ -141,7 +149,6 @@
   .unset td { background: var(--warn-bg); }
 
   @media (max-width: 900px) {
-    .drawer { left: 16px; width: auto; }
     .embedded .bar { padding-right: 16px; padding-top: 56px; }
   }
 </style>
@@ -161,53 +168,75 @@
     <input class="field" type="datetime-local" id="customEnd" aria-label="结束时间（留空为现在）">
     <button class="btn" type="button" id="applyCustom">应用</button>
   </span>
-  <input class="field" type="search" id="search" placeholder="搜索邮箱 / 文件名" aria-label="搜索账号">
-  <label class="check"><input type="checkbox" id="hideIdle"> 隐藏无用量账号</label>
+  <span id="listTools" style="display:contents">
+    <input class="field" type="search" id="search" placeholder="搜索邮箱 / 文件名" aria-label="搜索账号">
+    <label class="check"><input type="checkbox" id="hideIdle"> 隐藏无用量账号</label>
+  </span>
   <span class="spacer"></span>
   <span class="muted" id="updated"></span>
   <button class="btn" type="button" id="openPrices">单价设置</button>
   <button class="btn" type="button" id="refresh">刷新</button>
 </header>
 
-<section class="tiles" aria-label="所选时间段合计">
-  <div class="tile"><div class="k">有用量的账号</div><div class="v num" id="tAccounts">—</div><div class="d" id="tAccountsD"></div></div>
-  <div class="tile"><div class="k">请求次数</div><div class="v num" id="tRequests">—</div><div class="d" id="tRequestsD"></div></div>
-  <div class="tile"><div class="k">总 token</div><div class="v num" id="tTokens">—</div><div class="d" id="tTokensD"></div></div>
-  <div class="tile"><div class="k">花费（按设置的单价估算）</div><div class="v num" id="tCost">—</div><div class="d" id="tCostD"></div></div>
-</section>
-
 <div class="banner" id="banner" role="alert"><span id="bannerText"></span><span class="spacer"></span><button class="btn" type="button" id="bannerRetry">重试</button></div>
 
-<div class="main">
-  <div class="table-wrap">
+<main class="view" id="listView">
+  <section class="tiles" aria-label="所选时间段合计">
+    <div class="tile"><div class="k">有用量的账号</div><div class="v num" id="tAccounts">—</div><div class="d" id="tAccountsD"></div></div>
+    <div class="tile"><div class="k">请求次数</div><div class="v num" id="tRequests">—</div><div class="d" id="tRequestsD"></div></div>
+    <div class="tile"><div class="k">总 token</div><div class="v num" id="tTokens">—</div><div class="d" id="tTokensD"></div></div>
+    <div class="tile"><div class="k">花费（按设置的单价估算）</div><div class="v num" id="tCost">—</div><div class="d" id="tCostD"></div></div>
+  </section>
+  <div class="panel">
     <table id="accounts" aria-label="账号用量">
       <thead><tr id="accountsHead"></tr></thead>
       <tbody id="accountsBody"></tbody>
     </table>
-    <div class="table-foot" id="tableFoot"></div>
+    <div class="table-foot"><span id="tableFoot"></span><nav class="pager" id="listPager" aria-label="账号分页"></nav></div>
   </div>
-  <aside class="drawer" id="drawer" aria-label="账号明细">
-    <div class="drawer-head">
-      <div style="flex:1;min-width:0">
-        <div class="title" id="dTitle"></div>
-        <div class="meta" id="dMeta"></div>
-      </div>
-      <span id="dStatus"></span>
-      <button class="x" type="button" id="dClose" aria-label="关闭明细">×</button>
+</main>
+
+<main class="view" id="acctView" hidden>
+  <div class="acct-head">
+    <button class="btn" type="button" id="back">← 返回账号列表</button>
+    <div style="flex:1;min-width:0">
+      <div class="title" id="aTitle"></div>
+      <div class="meta" id="aMeta"></div>
     </div>
-    <div class="drawer-sum" id="dSum"></div>
-    <div class="drawer-body" id="dBody">
-      <table aria-label="请求明细">
+    <span id="aStatus"></span>
+  </div>
+  <section class="tiles" id="aTiles" aria-label="该账号在所选时间段的合计"></section>
+  <div class="notice" id="aNotice" hidden></div>
+  <div id="aSections">
+    <div class="sec-row"><h2>按模型</h2><span class="note">点击模型只看它的请求</span></div>
+    <div class="panel">
+      <table id="modelTable" aria-label="按模型的用量">
+        <thead><tr>
+          <th class="left">模型</th><th>请求</th><th>成功率</th><th>输入(含缓存)</th><th>缓存读取</th><th>输出(含推理)</th><th>总 token</th><th>花费</th>
+        </tr></thead>
+        <tbody id="modelRows"></tbody>
+      </table>
+    </div>
+    <div class="sec-row" id="recHead">
+      <h2>请求明细</h2>
+      <select class="field" id="fResult" aria-label="按结果筛选">
+        <option value="">全部结果</option><option value="ok">只看成功</option><option value="failed">只看失败</option>
+      </select>
+      <select class="field" id="fModel" aria-label="按模型筛选"></select>
+      <span class="note">失败的请求可点击查看原因</span>
+    </div>
+    <div class="panel">
+      <table id="recTable" aria-label="请求明细">
         <thead><tr>
           <th class="left">时间</th><th class="left">模型</th><th class="left">结果</th><th>耗时</th><th>首字</th>
-          <th title="输入（含缓存） / 缓存读取 / 输出（含推理）">输入 / 缓存 / 输出</th><th>花费</th>
+          <th>输入(含缓存)</th><th>缓存读取</th><th>输出(含推理)</th><th>总 token</th><th>花费</th>
         </tr></thead>
-        <tbody id="dRows"></tbody>
+        <tbody id="recRows"></tbody>
       </table>
-      <div class="sentinel" id="dSentinel"></div>
+      <div class="table-foot"><span id="recFoot"></span><nav class="pager" id="recPager" aria-label="明细分页"></nav></div>
     </div>
-  </aside>
-</div>
+  </div>
+</main>
 
 <div class="gate" id="gate">
   <div class="card" role="dialog" aria-modal="true" aria-labelledby="gateTitle">
@@ -257,7 +286,9 @@
   const LS_RANGE = 'usage-ui:range';
   const PANEL_AUTH_KEY = 'cli-proxy-auth';
   const PANEL_PRICES_KEY = 'cli-proxy-model-prices';
-  const RECORDS_PAGE = 100;
+  const LS_LIST_SIZE = 'usage-ui:list-page-size';
+  const LS_RECORDS_SIZE = 'usage-ui:records-page-size';
+  const PAGE_SIZES = [20, 50, 100];
   const FAILURE_PREVIEW = 4000;
 
   const $ = (id) => document.getElementById(id);
@@ -485,6 +516,10 @@
   const toRFC3339 = (date) => date.toISOString().replace(/\.\d{3}Z$/, 'Z');
 
   // ---- time range ----
+  function storedPageSize(key, fallback) {
+    const n = Number(storageGet(localStorage, key));
+    return PAGE_SIZES.includes(n) ? n : fallback;
+  }
   const state = {
     range: storageGet(localStorage, LS_RANGE) || 'today',
     custom: { start: '', end: '' },
@@ -495,11 +530,15 @@
     sort: { key: 'cost', dir: -1 },
     search: '',
     hideIdle: false,
-    selected: null,
-    drawer: { cursor: null, done: false, loading: false, gen: 0 },
+    list: { page: 1, size: storedPageSize(LS_LIST_SIZE, 20), scroll: 0 },
+    // The account view: which row (by key), and its records page and filters.
+    view: 'list',
+    acctKey: null,
+    fromList: false,
+    rec: { page: 1, size: storedPageSize(LS_RECORDS_SIZE, 50), model: '', result: '', records: [], total: null, loading: false, error: '', gen: 0 },
     loadGen: 0,
-    // What the data on screen covers. The drawer reuses params, so its pages
-    // match the table even if "today" rolls over or another range is pressed.
+    // What the data on screen covers, with the end frozen at load time, so the
+    // account view's pages match the summary and do not shift while browsing.
     params: null,
     loadedRange: '',
     loadedLabel: '',
@@ -509,15 +548,15 @@
   if (!['today', 'd7', 'd30', 'custom'].includes(state.range)) state.range = 'today';
   if (state.range === 'custom') state.range = 'today';
 
-  function rangeParams() {
-    const now = new Date();
+  function rangeParams(now) {
+    const end = toRFC3339(now);
     if (state.range === 'today') {
       const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-      return { start: toRFC3339(start) };
+      return { start: toRFC3339(start), end };
     }
-    if (state.range === 'd7') return { start: toRFC3339(new Date(now.getTime() - 7 * 864e5)) };
-    if (state.range === 'd30') return { start: toRFC3339(new Date(now.getTime() - 30 * 864e5)) };
-    const params = {};
+    if (state.range === 'd7') return { start: toRFC3339(new Date(now.getTime() - 7 * 864e5)), end };
+    if (state.range === 'd30') return { start: toRFC3339(new Date(now.getTime() - 30 * 864e5)), end };
+    const params = { end };
     if (state.custom.start) params.start = toRFC3339(new Date(state.custom.start));
     if (state.custom.end) params.end = toRFC3339(new Date(state.custom.end));
     return params;
@@ -619,8 +658,8 @@
     const t = (usage && usage.tokens) || {};
     const authIndex = (usage && usage.auth_index) || (cred && cred.auth_index) || '';
     return {
-      // Keyed by auth_index so a row keeps its identity (and an open drawer)
-      // when an idle credential gets its first usage.
+      // Keyed by auth_index so a row keeps its identity (and an open account
+      // view) when an idle credential gets its first usage.
       key: authIndex ? 'i|' + authIndex : 'a|' + ((usage && usage.auth_id) || ''),
       authIndex,
       authId: (usage && usage.auth_id) || '',
@@ -670,6 +709,7 @@
         h('button', { type: 'button', onclick: () => {
           if (state.sort.key === c.key) state.sort.dir = -state.sort.dir;
           else state.sort = { key: c.key, dir: c.key === 'label' || c.key === 'status' ? 1 : -1 };
+          state.list.page = 1;
           renderTable();
         } }, c.title));
     }));
@@ -691,6 +731,35 @@
     });
     return rows;
   }
+  // ---- pager: 共 N 条 · 每页 · ‹ 1 … 4 5 6 … 20 › · 跳至 ----
+  function renderPager(nav, { page, size, total, unit, onPage, onSize }) {
+    const pages = Math.max(1, Math.ceil(total / size));
+    const go = (p) => { p = Math.min(Math.max(1, Math.trunc(p) || 1), pages); if (p !== page) onPage(p); };
+    const nums = [...new Set([1, page - 2, page - 1, page, page + 1, page + 2, pages])].filter((p) => p >= 1 && p <= pages).sort((a, b) => a - b);
+    const items = [];
+    nums.forEach((p, i) => {
+      if (i && p - nums[i - 1] > 1) items.push(h('span', { class: 'gap', 'aria-hidden': 'true', text: '…' }));
+      items.push(h('button', {
+        class: 'pg num', type: 'button', 'aria-label': `第 ${p} 页`, 'aria-current': p === page ? 'page' : null, onclick: () => go(p),
+      }, String(p)));
+    });
+    const sizeSelect = h('select', { class: 'field', 'aria-label': '每页条数', onchange: (e) => onSize(Number(e.target.value)) },
+      PAGE_SIZES.map((n) => h('option', { value: String(n), selected: n === size }, `${n} ${unit}/页`)));
+    const jump = h('input', {
+      class: 'field num', type: 'number', min: '1', max: String(pages), placeholder: String(page), 'aria-label': '跳到第几页',
+      onkeydown: (e) => { if (e.key === 'Enter') go(Number(e.target.value)); },
+      onchange: (e) => go(Number(e.target.value)),
+    });
+    nav.replaceChildren(
+      h('span', { class: 'num', text: `共 ${fmtInt(total)} ${unit}` }),
+      sizeSelect,
+      h('button', { class: 'pg', type: 'button', 'aria-label': '上一页', disabled: page <= 1, onclick: () => go(page - 1) }, '‹'),
+      ...items,
+      h('button', { class: 'pg', type: 'button', 'aria-label': '下一页', disabled: page >= pages, onclick: () => go(page + 1) }, '›'),
+      pages > 1 ? h('label', null, '跳至 ', jump, ' 页') : null,
+    );
+  }
+
   function costCell(row) {
     if (!row.usage) return h('td', { class: 'num muted', text: '—' });
     const partial = row.unpriced.length > 0;
@@ -706,18 +775,22 @@
       const text = state.loadError ? `加载失败：${state.loadError}` : '加载中…';
       body.replaceChildren(h('tr', null, h('td', { colspan: COLUMNS.length, class: 'empty', text })));
       $('tableFoot').textContent = '';
+      $('listPager').replaceChildren();
       return;
     }
+    const { size } = state.list;
+    const pages = Math.max(1, Math.ceil(rows.length / size));
+    const page = state.list.page = Math.min(Math.max(1, state.list.page), pages);
+    const pageRows = rows.slice((page - 1) * size, page * size);
     if (!rows.length) {
       body.replaceChildren(h('tr', null, h('td', { colspan: COLUMNS.length, class: 'empty', text: state.rows.length ? '没有匹配的账号' : '暂无账号' })));
     } else {
-      body.replaceChildren(...rows.map((r) => {
+      body.replaceChildren(...pageRows.map((r) => {
         const tr = h('tr', {
           class: 'row' + (r.requests ? '' : ' idle'),
           tabindex: '0',
-          'aria-selected': String(state.selected === r.key),
-          onclick: () => openDrawer(r.key),
-          onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDrawer(r.key); } },
+          onclick: () => openAccount(r.key),
+          onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openAccount(r.key); } },
         },
         h('td', { title: [r.label, r.file !== r.label ? r.file : '', 'auth_index ' + r.authIndex].filter(Boolean).join('\n') },
           h('div', { class: 'acct' }, h('span', { text: r.label }), r.file && r.file !== r.label ? h('span', { class: 'file', text: r.file }) : null)),
@@ -735,7 +808,13 @@
     }
     const withUsage = state.rows.filter((r) => r.requests).length;
     const stale = state.loadError ? `刷新失败，下面是 ${fmtDateTime(state.loadedAt, true)} 的数据。` : '';
-    $('tableFoot').textContent = `${stale}显示 ${rows.length} / ${state.rows.length} 个账号，其中 ${withUsage} 个在「${state.loadedLabel}」有用量。点击一行查看逐条明细。`;
+    const filtered = rows.length !== state.rows.length ? `筛选出 ${rows.length} / ` : '';
+    $('tableFoot').textContent = `${stale}${filtered}共 ${state.rows.length} 个账号，其中 ${withUsage} 个在「${state.loadedLabel}」有用量。点击一行进入账号详情。`;
+    renderPager($('listPager'), {
+      page, size, total: rows.length, unit: '个',
+      onPage: (p) => { state.list.page = p; renderTable(); $('listView').scrollTop = 0; },
+      onSize: (n) => { state.list.size = n; state.list.page = 1; storageSet(localStorage, LS_LIST_SIZE, String(n)); renderTable(); },
+    });
   }
 
   function renderTiles() {
@@ -778,7 +857,7 @@
   async function load() {
     if (auth.blocked) return;
     const gen = ++state.loadGen;
-    const params = rangeParams();
+    const params = rangeParams(new Date());
     const requested = rangeKey();
     const label = rangeLabel();
     hideBanner();
@@ -796,6 +875,7 @@
         credsOk = false;
       }
       if (gen !== state.loadGen) return;
+      if (state.loadedRange !== requested) { state.list.page = 1; state.rec.page = 1; }
       Object.assign(state, {
         accounts, creds, credsOk, params,
         loadedRange: requested, loadedLabel: label, loadedAt: Date.now(), loadError: '',
@@ -804,66 +884,218 @@
       renderTiles();
       renderTable();
       $('updated').textContent = `「${label}」· 更新于 ${fmtDateTime(state.loadedAt, true).slice(11)}`;
-      if (state.selected) {
-        const row = state.rows.find((r) => r.key === state.selected);
-        if (row) openDrawer(row.key, true); else closeDrawer();
-      }
+      if (state.view === 'account') { renderAccount(); loadRecords(); }
     } catch (err) {
       if (err instanceof AuthError || gen !== state.loadGen) return;
       state.loadError = errorText(err);
       if (state.loadedRange !== requested) {
         // Never show another range's numbers under the newly pressed range.
         Object.assign(state, { accounts: null, rows: [], params: null, loadedRange: '', loadedLabel: '' });
-        closeDrawer();
+        Object.assign(state.rec, { records: [], total: null, loading: false, error: '', gen: state.rec.gen + 1 });
         $('updated').textContent = '';
       }
       renderTiles();
       renderTable();
+      if (state.view === 'account') { renderAccount(); renderRecords(); }
       showBanner(state.loadError);
     } finally {
       if (gen === state.loadGen) $('refresh').disabled = false;
     }
   }
 
-  // ---- drawer ----
-  function closeDrawer() {
-    state.selected = null;
-    state.drawer.gen++;
-    $('drawer').classList.remove('on');
-    for (const tr of $('accountsBody').querySelectorAll('tr.row')) tr.setAttribute('aria-selected', 'false');
+  // ---- account view (#account/<row key>) ----
+  function routeKey() {
+    const m = /^#account\/(.+)$/.exec(location.hash);
+    if (!m) return null;
+    try { return decodeURIComponent(m[1]); } catch { return null; }
   }
-  function openDrawer(key, keepScroll) {
-    const row = state.rows.find((r) => r.key === key);
-    if (!row) return;
-    state.selected = key;
-    for (const tr of $('accountsBody').querySelectorAll('tr.row')) tr.setAttribute('aria-selected', 'false');
-    renderTable();
-    $('drawer').classList.add('on');
-    $('dTitle').textContent = row.label;
-    $('dMeta').textContent = [row.provider, row.file, row.authIndex && 'auth_index ' + row.authIndex].filter(Boolean).join(' · ');
-    $('dStatus').replaceChildren(badge(row.status));
-    const sum = $('dSum');
-    if (row.usage) {
-      sum.replaceChildren(
-        h('span', null, '请求 ', h('b', { class: 'num', text: fmtInt(row.requests) }), `（成功率 ${fmtPct(row.success, row.requests)}）`),
-        h('span', null, '总 token ', h('b', { class: 'num', title: fmtInt(row.total), text: fmtTokens(row.total) })),
-        h('span', null, '花费 ', h('b', { class: 'num', text: fmtUSD(row.cost) }), row.unpriced.length ? h('span', { class: 'muted', text: `（${row.unpriced.join(', ')} 未设单价）` }) : null),
-        h('span', null, '时间段 ', h('b', { text: `${fmtShortTime(Date.parse(row.usage.first_request_at))} – ${fmtShortTime(row.last)}` })),
-      );
-    } else {
-      sum.replaceChildren(h('span', { text: '所选时间段内没有用量。' }));
-    }
-    if (!keepScroll) $('dBody').scrollTop = 0;
-    state.drawer = { cursor: null, done: false, loading: false, gen: state.drawer.gen + 1 };
-    $('dRows').replaceChildren();
-    if (!row.usage) { $('dSentinel').textContent = ''; state.drawer.done = true; return; }
-    if (!row.authIndex && !row.authId) {
-      // Without either filter /records would return every account's records.
-      $('dSentinel').textContent = '这组用量没有账号标识，无法单独列出明细。';
-      state.drawer.done = true;
+  function openAccount(key) {
+    state.fromList = true;
+    location.hash = '#account/' + encodeURIComponent(key);
+  }
+  function backToList() {
+    // Popping back to the list entry keeps browser Back/Forward in step.
+    if (state.fromList) history.back(); else location.hash = '';
+  }
+  function route() {
+    const key = routeKey();
+    if (key == null) {
+      if (state.view !== 'account') return;
+      state.view = 'list';
+      state.rec.gen++; // drop a records response still in flight
+      $('acctView').hidden = true;
+      $('listView').hidden = false;
+      $('listTools').hidden = false;
+      $('listView').scrollTop = state.list.scroll;
       return;
     }
-    loadMoreRecords();
+    if (state.view === 'list') state.list.scroll = $('listView').scrollTop;
+    state.view = 'account';
+    if (state.acctKey !== key) {
+      state.acctKey = key;
+      Object.assign(state.rec, { page: 1, model: '', result: '', records: [], total: null, error: '' });
+    }
+    $('listView').hidden = true;
+    $('listTools').hidden = true;
+    $('acctView').hidden = false;
+    $('acctView').scrollTop = 0;
+    renderAccount();
+    loadRecords();
+  }
+
+  // The row comes from the loaded data, never from the hash, so a stale or
+  // hand-edited link cannot turn into an unfiltered /records query.
+  function currentAccountRow() {
+    return (state.accounts && state.rows.find((r) => r.key === state.acctKey)) || null;
+  }
+  function tile(k, v, d, title) {
+    return h('div', { class: 'tile' },
+      h('div', { class: 'k', text: k }), h('div', { class: 'v num', title, text: v }), h('div', { class: 'd' }, d));
+  }
+  function renderAccount() {
+    const row = currentAccountRow();
+    $('aStatus').replaceChildren();
+    $('aTiles').replaceChildren();
+    $('aNotice').hidden = true;
+    $('aSections').hidden = true;
+    if (!row) {
+      $('aTitle').textContent = state.accounts ? '找不到这个账号' : state.loadError ? '加载失败' : '加载中…';
+      $('aMeta').textContent = state.accounts ? '它可能已被删除，或者链接不完整。' : '';
+      return;
+    }
+    $('aTitle').textContent = row.label;
+    $('aMeta').textContent = [row.provider, row.file !== row.label ? row.file : '', row.authIndex && 'auth_index ' + row.authIndex].filter(Boolean).join(' · ');
+    $('aStatus').replaceChildren(badge(row.status));
+    const u = row.usage;
+    if (!u) {
+      $('aNotice').hidden = false;
+      $('aNotice').textContent = `这个账号在「${state.loadedLabel}」没有用量，可以换个时间范围看看。`;
+      return;
+    }
+    $('aSections').hidden = false;
+    const unpriced = row.unpriced.length
+      ? h('span', null, `${row.unpriced.join(', ')} 未设单价，不计入：`, h('button', { class: 'link', type: 'button', onclick: openPrices, text: '去设置' }))
+      : '所有模型都已设单价';
+    $('aTiles').replaceChildren(
+      tile('请求次数', fmtInt(row.requests), `成功率 ${fmtPct(row.success, row.requests)}，失败 ${fmtInt(row.failed)}`),
+      tile('总 token', fmtTokens(row.total), `输入 ${fmtTokens(row.input)}（缓存 ${fmtTokens(row.cached)}）· 输出 ${fmtTokens(row.output)}`, fmtInt(row.total)),
+      tile('花费（按设置的单价估算）', fmtUSD(row.cost), unpriced),
+      tile('最近调用', fmtShortTime(row.last), `「${state.loadedLabel}」首次 ${fmtShortTime(Date.parse(u.first_request_at))}`, fmtDateTime(row.last, true)),
+    );
+    const models = u.models || [];
+    if (state.rec.model && !models.some((m) => m.model === state.rec.model)) state.rec.model = '';
+    $('modelRows').replaceChildren(...models.map((m) => {
+      const t = m.tokens || {};
+      const pick = () => { setRecordsFilter({ model: state.rec.model === m.model ? '' : m.model }); scrollToRecords(); };
+      return h('tr', {
+        class: 'row', tabindex: '0', title: '只看这个模型的请求（再点一次取消）',
+        'aria-selected': String(state.rec.model === m.model),
+        onclick: pick,
+        onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } },
+      },
+      h('td', { class: 'left', text: m.model }),
+      h('td', { class: 'num', title: `成功 ${fmtInt(m.success)} / 失败 ${fmtInt(m.failed)}` }, fmtInt(m.requests)),
+      h('td', { class: 'num' }, fmtPct(m.success, m.requests)),
+      h('td', { class: 'num', title: fmtInt(t.input_tokens) }, fmtTokens(t.input_tokens)),
+      h('td', { class: 'num', title: fmtInt(t.cached_tokens) }, fmtTokens(t.cached_tokens)),
+      h('td', { class: 'num', title: `${fmtInt(t.output_tokens)}（其中推理 ${fmtInt(t.reasoning_tokens)}）` }, fmtTokens(t.output_tokens)),
+      h('td', { class: 'num', title: fmtInt(t.total_tokens) }, fmtTokens(t.total_tokens)),
+      m.cost_usd == null ? h('td', { class: 'num muted', text: '未设单价' }) : h('td', { class: 'num' }, fmtUSD(m.cost_usd)));
+    }));
+    $('fModel').replaceChildren(h('option', { value: '' }, '全部模型'), ...models.map((m) => h('option', { value: m.model }, m.model)));
+    $('fModel').value = state.rec.model;
+    $('fResult').value = state.rec.result;
+  }
+  function setRecordsFilter(changes) {
+    Object.assign(state.rec, changes, { page: 1 });
+    renderAccount();
+    loadRecords();
+  }
+  // Brings the records heading back into view after paging from the bottom.
+  function scrollToRecords() {
+    const view = $('acctView');
+    const offset = $('recHead').getBoundingClientRect().top - view.getBoundingClientRect().top;
+    if (offset < 0 || offset > view.clientHeight) view.scrollTop += offset;
+  }
+
+  const REC_COLUMNS = 10;
+  function renderRecords() {
+    const rec = state.rec;
+    const row = currentAccountRow();
+    const body = $('recRows');
+    $('recTable').classList.toggle('loading', rec.loading && rec.records.length > 0);
+    if (rec.error) {
+      const canRetry = row && (row.authIndex || row.authId);
+      body.replaceChildren(h('tr', null, h('td', { colspan: REC_COLUMNS, class: 'empty' }, rec.error, ' ',
+        canRetry ? h('button', { class: 'btn', type: 'button', onclick: loadRecords }, '重试') : null)));
+    } else if (!rec.records.length) {
+      const text = rec.loading || rec.total == null ? '加载中…' : rec.model || rec.result ? '没有符合筛选条件的请求' : '没有记录';
+      body.replaceChildren(h('tr', null, h('td', { colspan: REC_COLUMNS, class: 'empty', text })));
+    } else {
+      body.replaceChildren(...rec.records.map(recordRow));
+    }
+    if (rec.total == null) {
+      $('recFoot').textContent = '';
+      $('recPager').replaceChildren();
+      return;
+    }
+    const from = (rec.page - 1) * rec.size + 1;
+    const to = Math.min(rec.page * rec.size, rec.total);
+    $('recFoot').textContent = rec.total ? `第 ${fmtInt(from)}–${fmtInt(to)} 条` : '';
+    renderPager($('recPager'), {
+      page: rec.page, size: rec.size, total: rec.total, unit: '条',
+      onPage: (p) => { rec.page = p; loadRecords(); scrollToRecords(); },
+      onSize: (n) => { rec.size = n; rec.page = 1; storageSet(localStorage, LS_RECORDS_SIZE, String(n)); loadRecords(); },
+    });
+  }
+
+  async function loadRecords() {
+    const rec = state.rec;
+    const gen = ++rec.gen;
+    const row = currentAccountRow();
+    rec.error = '';
+    if (!row || !row.usage || !state.params) {
+      Object.assign(rec, { records: [], total: null, loading: false });
+      renderRecords();
+      return;
+    }
+    if (!row.authIndex && !row.authId) {
+      // Without either filter /records would return every account's records.
+      Object.assign(rec, { records: [], total: null, loading: false, error: '这组用量没有账号标识，无法单独列出明细。' });
+      renderRecords();
+      return;
+    }
+    if (auth.blocked) return;
+    rec.loading = true;
+    renderRecords();
+    try {
+      // The summary's frozen range, and both identifiers so the filter matches
+      // exactly one usage group.
+      const params = Object.assign({}, state.params, { page: rec.page, limit: rec.size });
+      if (row.authIndex) params.auth_index = row.authIndex;
+      if (row.authId) params.auth_id = row.authId;
+      if (rec.model) params.model = rec.model;
+      if (rec.result) params.failed = rec.result === 'failed' ? 'true' : 'false';
+      const res = await api(API.records, { params });
+      if (gen !== rec.gen) return;
+      const total = res.total || 0;
+      const last = Math.max(1, Math.ceil(total / rec.size));
+      if (rec.page > last) {
+        // Fewer records than before (e.g. retention cleanup): show the last page.
+        rec.page = last;
+        loadRecords();
+        return;
+      }
+      Object.assign(rec, { records: res.records || [], total });
+    } catch (err) {
+      if (gen !== rec.gen) return;
+      if (!(err instanceof AuthError)) rec.error = errorText(err);
+    } finally {
+      if (gen === rec.gen) {
+        rec.loading = false;
+        renderRecords();
+      }
+    }
   }
 
   function recordRow(rec) {
@@ -877,8 +1109,10 @@
       h('td', { class: 'left res', text: result }),
       h('td', { class: 'num', text: fmtDuration(rec.latency_ms) }),
       h('td', { class: 'num', text: fmtDuration(rec.ttft_ms) }),
-      h('td', { class: 'num', title: `输入 ${fmtInt(t.input_tokens)} / 缓存读取 ${fmtInt(t.cached_tokens)} / 输出 ${fmtInt(t.output_tokens)}（推理 ${fmtInt(t.reasoning_tokens)}）` },
-        `${fmtTokens(t.input_tokens)} / ${fmtTokens(t.cached_tokens)} / ${fmtTokens(t.output_tokens)}`),
+      h('td', { class: 'num', title: fmtInt(t.input_tokens) }, fmtTokens(t.input_tokens)),
+      h('td', { class: 'num', title: fmtInt(t.cached_tokens) }, fmtTokens(t.cached_tokens)),
+      h('td', { class: 'num', title: `${fmtInt(t.output_tokens)}（其中推理 ${fmtInt(t.reasoning_tokens)}）` }, fmtTokens(t.output_tokens)),
+      h('td', { class: 'num', title: fmtInt(t.total_tokens) }, fmtTokens(t.total_tokens)),
       h('td', { class: 'num', title: rec.cost_usd == null ? '该模型未设单价' : '' }, fmtUSD(rec.cost_usd)));
     if (failed) {
       let detail = null;
@@ -886,7 +1120,7 @@
         if (detail) { detail.remove(); detail = null; return; }
         const full = rec.failure_body || '(无失败内容)';
         const shown = full.length > FAILURE_PREVIEW ? full.slice(0, FAILURE_PREVIEW) + '\n…（已截断，共 ' + fmtInt(full.length) + ' 字符）' : full;
-        detail = h('tr', { class: 'detail' }, h('td', { colspan: 7 },
+        detail = h('tr', { class: 'detail' }, h('td', { colspan: REC_COLUMNS },
           h('pre', { class: 'body', text: shown }),
           h('button', { class: 'btn', type: 'button', style: 'margin-top:6px', onclick: (e) => {
             e.stopPropagation();
@@ -896,42 +1130,6 @@
       });
     }
     return tr;
-  }
-
-  async function loadMoreRecords() {
-    const d = state.drawer;
-    if (d.loading || d.done || !state.selected || !state.params || auth.blocked) return;
-    const row = state.rows.find((r) => r.key === state.selected);
-    if (!row || (!row.authIndex && !row.authId)) return;
-    const gen = d.gen;
-    d.loading = true;
-    $('dSentinel').textContent = '加载中…';
-    try {
-      // Same range as the table (fixed at load time), and both identifiers so
-      // the filter matches exactly one usage group.
-      const params = Object.assign({ limit: RECORDS_PAGE }, state.params);
-      if (row.authIndex) params.auth_index = row.authIndex;
-      if (row.authId) params.auth_id = row.authId;
-      if (d.cursor) params.cursor = d.cursor;
-      const page = await api(API.records, { params });
-      if (gen !== state.drawer.gen) return;
-      $('dRows').append(...page.records.map(recordRow));
-      d.cursor = page.next_cursor;
-      d.done = !page.next_cursor;
-      $('dSentinel').textContent = d.done ? ($('dRows').children.length ? '已到底' : '没有记录') : '';
-      if (!d.done) $('dSentinel').append(h('button', { class: 'btn', type: 'button', onclick: loadMoreRecords }, '加载更多'));
-    } catch (err) {
-      if (gen !== state.drawer.gen) return;
-      if (err instanceof AuthError) $('dSentinel').replaceChildren();
-      else $('dSentinel').replaceChildren(errorText(err), ' ', h('button', { class: 'btn', type: 'button', onclick: loadMoreRecords }, '重试'));
-    } finally {
-      if (gen === state.drawer.gen) d.loading = false;
-    }
-  }
-  if ('IntersectionObserver' in window) {
-    new IntersectionObserver((entries) => {
-      if (entries.some((e) => e.isIntersecting) && !state.drawer.done) loadMoreRecords();
-    }, { root: $('dBody'), rootMargin: '200px' }).observe($('dSentinel'));
   }
 
   // ---- prices dialog ----
@@ -1085,15 +1283,17 @@
     state.custom = { start, end };
     load();
   });
-  $('search').addEventListener('input', (e) => { state.search = e.target.value; renderTable(); });
-  $('hideIdle').addEventListener('change', (e) => { state.hideIdle = e.target.checked; renderTable(); });
+  $('search').addEventListener('input', (e) => { state.search = e.target.value; state.list.page = 1; renderTable(); });
+  $('hideIdle').addEventListener('change', (e) => { state.hideIdle = e.target.checked; state.list.page = 1; renderTable(); });
   $('refresh').addEventListener('click', load);
   $('bannerRetry').addEventListener('click', () => {
     if (auth.blocked) { showGate(''); return; }
     load();
   });
-  $('dClose').addEventListener('click', closeDrawer);
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && $('drawer').classList.contains('on') && !$('prices').open) closeDrawer(); });
+  $('back').addEventListener('click', backToList);
+  $('fResult').addEventListener('change', (e) => setRecordsFilter({ result: e.target.value }));
+  $('fModel').addEventListener('change', (e) => setRecordsFilter({ model: e.target.value }));
+  window.addEventListener('hashchange', route);
   $('openPrices').addEventListener('click', openPrices);
   $('pricesClose').addEventListener('click', () => $('prices').close());
   $('priceCancel').addEventListener('click', () => $('prices').close());
@@ -1131,6 +1331,7 @@
   renderRangeButtons();
   renderTiles();
   renderTable();
+  route();
   if (currentKey()) load(); else { auth.blocked = true; showGate(''); }
 })();
 </script>

@@ -46,11 +46,12 @@ const (
 
 	defaultRecordsLimit = 100
 	maxRecordsLimit     = 1000
+	maxRecordsPage      = 1000000
 )
 
 // Overridable at build time via -ldflags "-X main.pluginVersion=...".
 var (
-	pluginVersion    = "0.3.0-acct.1"
+	pluginVersion    = "0.4.0-acct.1"
 	pluginAuthor     = "Fwindy"
 	pluginRepository = "https://github.com/Fwindy/cpa-usage-statistics"
 )
@@ -389,16 +390,32 @@ func recordsGet(req managementRequest) ([]byte, error) {
 		Range:     rng,
 		AuthIndex: strings.TrimSpace(firstValue(req.Query, "auth_index")),
 		AuthID:    strings.TrimSpace(firstValue(req.Query, "auth_id")),
+		Model:     strings.TrimSpace(firstValue(req.Query, "model")),
 		Limit:     limit,
 		Cursor:    strings.TrimSpace(firstValue(req.Query, "cursor")),
 	}
-	store := currentStore()
-	if store == nil {
-		return okEnvelope(jsonManagementResponse(200, RecordsPage{Records: []RecordDetail{}}))
+	if raw := strings.TrimSpace(firstValue(req.Query, "failed")); raw != "" {
+		failed, err := strconv.ParseBool(raw)
+		if err != nil {
+			return okEnvelope(jsonManagementResponse(400, map[string]string{"error": "invalid failed"}))
+		}
+		q.Failed = &failed
+	}
+	if raw := strings.TrimSpace(firstValue(req.Query, "page")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		// The cap keeps (page-1)*limit far from overflow.
+		if err != nil || parsed <= 0 || parsed > maxRecordsPage {
+			return okEnvelope(jsonManagementResponse(400, map[string]string{"error": "invalid page"}))
+		}
+		if q.Cursor != "" {
+			return okEnvelope(jsonManagementResponse(400, map[string]string{"error": "page and cursor cannot be combined"}))
+		}
+		q.Page = parsed
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
 	defer cancel()
-	page, err := store.ListRecords(ctx, q)
+	// A nil store answers an empty page (total 0 for numbered paging).
+	page, err := currentStore().ListRecords(ctx, q)
 	if errors.Is(err, errInvalidCursor) {
 		return okEnvelope(jsonManagementResponse(400, map[string]string{"error": "invalid cursor"}))
 	}

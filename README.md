@@ -2,7 +2,7 @@
 
 CLIProxyAPI 的持久化用量统计插件。记录每次请求的用量，写入本地 SQLite；提供查询/删除接口。字段命名对齐上游 `usage.Record` / `usage.Detail`。
 
-当前版本：`0.3.0-acct.1`（在 `0.1.0` 基础上增加按账号汇总、按账号分页明细、单价与花费，以及面板侧边栏里的"账号用量"页面）
+当前版本：`0.4.0-acct.1`（在 `0.1.0` 基础上增加按账号汇总、按账号分页明细、单价与花费，以及面板侧边栏里的"账号用量"页面，含分页的账号列表和账号详情）
 
 ## 建议使用配套的前端面板
 
@@ -120,14 +120,17 @@ GET /v0/management/plugins/usage-statistics/accounts?start=<RFC3339>&end=<RFC333
       "first_request_at": "2026-10-22T06:40:53.1Z",
       "last_request_at": "2026-10-22T06:48:37.2Z",
       "cost_usd": 1.12999,
-      "unpriced_models": []
+      "unpriced_models": [],
+      "models": [
+        { "model": "muse-wonder-full-1.0", "requests": 17, "success": 16, "failed": 1, "tokens": { "...": 0 }, "cost_usd": 1.12999 }
+      ]
     }
   ],
   "totals": { "accounts": 1, "requests": 17, "success": 16, "failed": 1, "tokens": { "...": 0 }, "cost_usd": 1.12999 }
 }
 ```
 
-`cost_usd` 只计已设单价的模型；没设单价的模型列在 `unpriced_models` 里。
+`cost_usd` 只计已设单价的模型；没设单价的模型列在 `unpriced_models` 里。`models` 是该账号按模型拆分的用量，按 `total_tokens` 降序；没设单价的模型 `cost_usd` 为 `null`。
 
 `total_tokens` 是该账号所有记录 `total_tokens` 之和（缓存计入输入、推理计入输出，不要再相加）。汇总要扫描范围内所有记录（约 1 秒 / 50 万条），数据量大时请带 `start`/`end` 或配置 `retention_days`。
 
@@ -135,16 +138,20 @@ GET /v0/management/plugins/usage-statistics/accounts?start=<RFC3339>&end=<RFC333
 
 ```
 GET /v0/management/plugins/usage-statistics/records?auth_index=<auth_index>&start=<RFC3339>&end=<RFC3339>&limit=100&cursor=<next_cursor>
+GET /v0/management/plugins/usage-statistics/records?auth_index=<auth_index>&start=<RFC3339>&end=<RFC3339>&limit=50&page=3&model=<model>&failed=true
 ```
 
-- 按时间倒序（`timestamp DESC, id DESC`）。`auth_index`、`auth_id`、`start`、`end` 均为可选过滤条件。按账号查询请带 `auth_index`（`/accounts` 返回值里有），只带 `auth_id` 没有索引，数据量大时会慢。
+- 按时间倒序（`timestamp DESC, id DESC`）。`auth_index`、`auth_id`、`start`、`end`、`model`（精确匹配）、`failed`（`true`/`false`）均为可选过滤条件，无效的 `failed` 返回 400。按账号查询请带 `auth_index`（`/accounts` 返回值里有），只带 `auth_id` 没有索引，数据量大时会慢。
 - `limit` 缺省 100，最大 1000（超过按 1000 处理），非正整数返回 400。
-- 首页不带 `cursor`；把上一页的 `next_cursor` 原样传回取下一页；`next_cursor` 为 `null` 表示最后一页。无效 `cursor` 返回 400。
+- 两种翻页方式，二选一（同时带返回 400）：
+  - **游标：** 首页不带 `cursor`；把上一页的 `next_cursor` 原样传回取下一页；`next_cursor` 为 `null` 表示最后一页。无效 `cursor` 返回 400。
+  - **页码：** `page` 从 1 开始（最大 1000000，否则返回 400），响应多一个 `total`，即符合条件的总条数。超出最后一页返回空列表。页码用 OFFSET 实现，翻得越深越慢；浏览时建议固定 `end`，否则新记录进来会让页面内容往后移。
 
 ```jsonc
 {
   "records": [ { "id": "…", "timestamp": "…", "auth_index": "…", "model": "…", "tokens": { "...": 0 }, "failed": false, "cost_usd": 0.0712 } ],
-  "next_cursor": "MjAyNi0xMC0yMlQwNjo0MD…"
+  "next_cursor": "MjAyNi0xMC0yMlQwNjo0MD…",
+  "total": 1234
 }
 ```
 
@@ -179,6 +186,10 @@ Content-Type: application/json
 ## 账号用量页面
 
 插件注册了一个面板菜单"账号用量"，页面路径 `/v0/resource/plugins/usage-statistics/ui`。配套面板和官方面板都会把它显示在侧边栏，并以 iframe 嵌入。页面本身不需要鉴权且不含任何数据，数据都通过上面那些需要管理密钥的接口获取。
+
+- **账号列表：** 汇总卡片和账号表，支持排序、搜索和分页（每页 20 / 50 / 100 个）。
+- **账号详情：** 点击一行进入（地址为 `#account/<账号>`，浏览器后退可回到列表）。页面包括账号状态、汇总卡片、按模型拆分，以及请求明细。请求明细可按结果和模型筛选，按页码翻页（每页 20 / 50 / 100 条，可跳页）。失败的请求点击后可查看原因。
+- 时间范围的结束时间在加载时固定，翻页时内容不会因为新记录进来而移动，点"刷新"才更新。
 
 ## 说明
 

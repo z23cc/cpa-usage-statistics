@@ -93,6 +93,19 @@ type AccountUsage struct {
 	// CostUSD covers only priced models; UnpricedModels lists the rest.
 	CostUSD        float64  `json:"cost_usd"`
 	UnpricedModels []string `json:"unpriced_models"`
+	// Models breaks the account down per model, by total tokens descending.
+	Models []ModelUsage `json:"models"`
+}
+
+// ModelUsage is one model's share of an account. CostUSD is null when the
+// model has no price.
+type ModelUsage struct {
+	Model    string     `json:"model"`
+	Requests int64      `json:"requests"`
+	Success  int64      `json:"success"`
+	Failed   int64      `json:"failed"`
+	Tokens   TokenStats `json:"tokens"`
+	CostUSD  *float64   `json:"cost_usd"`
 }
 
 // UsageTotals sums every account in an accounts response.
@@ -116,9 +129,15 @@ type RecordsQuery struct {
 	Range     QueryRange
 	AuthIndex string
 	AuthID    string
-	Limit     int
+	// Model and Failed narrow the records further; empty / nil match all.
+	Model  string
+	Failed *bool
+	Limit  int
 	// Cursor is the opaque next_cursor of the previous page; empty for the first page.
 	Cursor string
+	// Page (1-based) selects numbered paging instead of Cursor and makes the
+	// response carry Total; 0 means cursor paging.
+	Page int
 }
 
 // RecordDetail is one /records row: the stored record plus its cost. CostUSD
@@ -130,10 +149,12 @@ type RecordDetail struct {
 }
 
 // RecordsPage is the body of GET /plugins/usage-statistics/records.
-// NextCursor is null on the last page.
+// NextCursor is null on the last page. Total counts every matching record and
+// is only present for numbered paging.
 type RecordsPage struct {
 	Records    []RecordDetail `json:"records"`
 	NextCursor *string        `json:"next_cursor"`
+	Total      *int64         `json:"total,omitempty"`
 }
 
 // ModelPrice is one model's price in USD per 1M tokens, the panel's unit.
