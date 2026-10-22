@@ -534,7 +534,6 @@
     // The account view: which row (by key), and its records page and filters.
     view: 'list',
     acctKey: null,
-    fromList: false,
     rec: { page: 1, size: storedPageSize(LS_RECORDS_SIZE, 50), model: '', result: '', records: [], total: null, loading: false, error: '', gen: 0 },
     loadGen: 0,
     // What the data on screen covers, with the end frozen at load time, so the
@@ -789,6 +788,7 @@
         const tr = h('tr', {
           class: 'row' + (r.requests ? '' : ' idle'),
           tabindex: '0',
+          'data-key': r.key,
           onclick: () => openAccount(r.key),
           onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openAccount(r.key); } },
         },
@@ -910,12 +910,15 @@
     try { return decodeURIComponent(m[1]); } catch { return null; }
   }
   function openAccount(key) {
-    state.fromList = true;
     location.hash = '#account/' + encodeURIComponent(key);
+    // Marks this entry as opened from the list (the fragment navigation above
+    // is synchronous), so 返回 can pop it instead of pushing another entry.
+    history.replaceState({ fromList: true }, '');
   }
   function backToList() {
-    // Popping back to the list entry keeps browser Back/Forward in step.
-    if (state.fromList) history.back(); else location.hash = '';
+    // Only pop when the previous entry is this page's list; otherwise Back
+    // could leave the page (or navigate the panel around the iframe).
+    if (history.state && history.state.fromList) history.back(); else location.hash = '';
   }
   function route() {
     const key = routeKey();
@@ -927,6 +930,8 @@
       $('listView').hidden = false;
       $('listTools').hidden = false;
       $('listView').scrollTop = state.list.scroll;
+      const rowEl = [...$('accountsBody').querySelectorAll('tr.row')].find((tr) => tr.dataset.key === state.acctKey);
+      if (rowEl) rowEl.focus({ preventScroll: true });
       return;
     }
     if (state.view === 'list') state.list.scroll = $('listView').scrollTop;
@@ -939,6 +944,7 @@
     $('listTools').hidden = true;
     $('acctView').hidden = false;
     $('acctView').scrollTop = 0;
+    $('back').focus({ preventScroll: true });
     renderAccount();
     loadRecords();
   }
@@ -1069,11 +1075,14 @@
     rec.loading = true;
     renderRecords();
     try {
-      // The summary's frozen range, and both identifiers so the filter matches
-      // exactly one usage group.
+      // The summary's frozen range, and enough identifiers to match exactly
+      // one usage group.
       const params = Object.assign({}, state.params, { page: rec.page, limit: rec.size });
       if (row.authIndex) params.auth_index = row.authIndex;
-      if (row.authId) params.auth_id = row.authId;
+      // auth_id is not in the (auth_index, timestamp) index, so it would make
+      // every COUNT read the table; send it only when auth_index is ambiguous.
+      const shared = state.accounts.accounts.filter((a) => a.auth_index === row.authIndex).length > 1;
+      if (row.authId && (!row.authIndex || shared)) params.auth_id = row.authId;
       if (rec.model) params.model = rec.model;
       if (rec.result) params.failed = rec.result === 'failed' ? 'true' : 'false';
       const res = await api(API.records, { params });
