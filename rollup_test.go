@@ -1037,3 +1037,290 @@ func TestCleanedHourEndEdge(t *testing.T) {
 	wantAccounts(t, store, QueryRange{End: tp(utc(10, 10, 35, 0))},
 		map[string][2]int64{"A": {3, 19}, "B": {2, 96}})
 }
+
+// ---- review follow-ups: rollup init safety, control row, zero bounds --------
+
+// rawExec runs statements on a plain connection to path (no plugin code).
+func rawExec(t *testing.T, path string, stmts ...string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	for _, s := range stmts {
+		if _, err := db.Exec(s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+}
+
+func rawStrings(t *testing.T, path, query string) []string {
+	t.Helper()
+	db, err := sql.Open("sqlite", path+"?_pragma=query_only(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	return queryStrings(t, db, query)
+}
+
+const dumpHourly = `SELECT * FROM usage_hourly ORDER BY bucket, auth_index, auth_id, model`
+const dumpDaily = `SELECT * FROM usage_daily ORDER BY bucket, auth_index, auth_id, model`
+
+// retainedStore has 5 days of records with the first 3 days cleaned up, so the
+// rollups hold history the details no longer have. It is closed on return.
+func retainedStore(t *testing.T, path string) (hourly, daily []string) {
+	t.Helper()
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertBulk(t, store, randomRecords(rand.New(rand.NewSource(11)), utc(1, 0, 0, 0), 5, 800))
+	if n, err := store.DeleteBefore(context.Background(), utc(3, 0, 0, 0)); err != nil || n == 0 {
+		t.Fatalf("DeleteBefore = %d, %v", n, err)
+	}
+	hourly, daily = rollupDump(t, store, "usage_hourly"), rollupDump(t, store, "usage_daily")
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return hourly, daily
+}
+
+func TestInitRollupVersionResetKeepsHistory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.db")
+	hourly, daily := retainedStore(t, path)
+	rawExec(t, path, `PRAGMA user_version = 0`) // what .dump / .recover leave behind
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	if v := scalarInt(t, store.db, `PRAGMA user_version`); v != rollupSchemaVersion {
+		t.Fatalf("user_version = %d", v)
+	}
+	if !reflect.DeepEqual(hourly, rollupDump(t, store, "usage_hourly")) || !reflect.DeepEqual(daily, rollupDump(t, store, "usage_daily")) {
+		t.Fatal("rollups were wiped or rebuilt")
+	}
+	// A rebuild from the kept details would have lost days 1-2.
+	if rolled, kept := scalarInt(t, store.db, `SELECT SUM(requests) FROM usage_daily`), scalarInt(t, store.db, `SELECT COUNT(*) FROM usage_records`); rolled <= kept {
+		t.Fatalf("rollup requests %d <= kept details %d", rolled, kept)
+	}
+}
+
+func TestInitRollupRefusesDataWithoutTriggers(t *testing.T) {
+	for name, drop := range map[string][]string{
+		"both triggers":  {`DROP TRIGGER usage_records_rollup_ai`, `DROP TRIGGER usage_records_rollup_ad`},
+		"delete trigger": {`DROP TRIGGER usage_records_rollup_ad`},
+		"insert trigger": {`DROP TRIGGER usage_records_rollup_ai`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "usage.db")
+			hourly, daily := retainedStore(t, path)
+			rawExec(t, path, append(drop, `PRAGMA user_version = 0`)...)
+			store, err := NewSQLiteStore(path)
+			if err == nil {
+				_ = store.Close()
+				t.Fatal("NewSQLiteStore succeeded with rollup data and missing triggers")
+			}
+			if !strings.Contains(err.Error(), "trigger") {
+				t.Fatalf("error does not mention triggers: %v", err)
+			}
+			if got := rawStrings(t, path, dumpHourly); !reflect.DeepEqual(got, hourly) {
+				t.Fatal("hourly rollup touched")
+			}
+			if got := rawStrings(t, path, dumpDaily); !reflect.DeepEqual(got, daily) {
+				t.Fatal("daily rollup touched")
+			}
+			if v := rawStrings(t, path, `PRAGMA user_version`); v[0] != "0" {
+				t.Fatalf("user_version = %v after refusal", v)
+			}
+		})
+	}
+}
+
+func TestInitRollupEmptyTablesWithoutTriggersBackfills(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.db")
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertBulk(t, store, randomRecords(rand.New(rand.NewSource(12)), utc(1, 0, 0, 0), 3, 300))
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rawExec(t, path, `DROP TRIGGER usage_records_rollup_ai`, `DROP TRIGGER usage_records_rollup_ad`,
+		`DELETE FROM usage_hourly`, `DELETE FROM usage_daily`, `PRAGMA user_version = 0`)
+	store, err = NewSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	assertRollupsMatchDetails(t, store)
+	if n := scalarInt(t, store.db, `SELECT COUNT(*) FROM usage_daily`); n == 0 {
+		t.Fatal("nothing backfilled")
+	}
+	if n := scalarInt(t, store.db, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'usage_records_rollup_%'`); n != 2 {
+		t.Fatalf("triggers = %d", n)
+	}
+	if v := scalarInt(t, store.db, `PRAGMA user_version`); v != rollupSchemaVersion {
+		t.Fatalf("user_version = %d", v)
+	}
+}
+
+func TestDeleteBeforeRefusesWithoutControlRow(t *testing.T) {
+	store := newTestStore(t)
+	insertBulk(t, store, randomRecords(rand.New(rand.NewSource(13)), utc(1, 0, 0, 0), 4, 400))
+	hourly, daily := rollupDump(t, store, "usage_hourly"), rollupDump(t, store, "usage_daily")
+	before := scalarInt(t, store.db, `SELECT COUNT(*) FROM usage_records`)
+	if _, err := store.db.Exec(`DELETE FROM usage_rollup_control`); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := store.DeleteBefore(context.Background(), utc(10, 0, 0, 0))
+	if err == nil || !strings.Contains(err.Error(), "control row") {
+		t.Fatalf("DeleteBefore = %d, %v", deleted, err)
+	}
+	if deleted != 0 {
+		t.Fatalf("deleted = %d", deleted)
+	}
+	if after := scalarInt(t, store.db, `SELECT COUNT(*) FROM usage_records`); after != before {
+		t.Fatalf("details %d -> %d", before, after)
+	}
+	if !reflect.DeepEqual(hourly, rollupDump(t, store, "usage_hourly")) || !reflect.DeepEqual(daily, rollupDump(t, store, "usage_daily")) {
+		t.Fatal("rollups changed")
+	}
+}
+
+func TestAccountSummaryZeroTimeIsOpenBound(t *testing.T) {
+	store := newTestStore(t)
+	insertBulk(t, store, randomRecords(rand.New(rand.NewSource(14)), utc(1, 0, 0, 0), 3, 500))
+	var zero time.Time
+	mid := tp(utc(2, 7, 30, 0))
+	for name, c := range map[string]struct{ got, want QueryRange }{
+		"zero start":      {QueryRange{Start: &zero}, QueryRange{}},
+		"zero end":        {QueryRange{End: &zero}, QueryRange{}},
+		"both zero":       {QueryRange{Start: &zero, End: &zero}, QueryRange{}},
+		"zero start, end": {QueryRange{Start: &zero, End: mid}, QueryRange{End: mid}},
+		"start, zero end": {QueryRange{Start: mid, End: &zero}, QueryRange{Start: mid}},
+	} {
+		got, err := store.AccountSummary(context.Background(), c.got)
+		if err != nil {
+			t.Fatal(name, err)
+		}
+		want, err := store.AccountSummary(context.Background(), c.want)
+		if err != nil {
+			t.Fatal(name, err)
+		}
+		if len(want.Accounts) == 0 || !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: got %+v\nwant %+v", name, got.Totals, want.Totals)
+		}
+	}
+}
+
+func TestWriterPragmasAndImmediateTx(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.db")
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	if n := scalarInt(t, store.db, `PRAGMA journal_size_limit`); n != 8388608 {
+		t.Fatalf("journal_size_limit = %d", n)
+	}
+	insertAll(t, store, Record{ID: "w", Timestamp: utc(10, 1, 0, 0), AuthIndex: "a"})
+
+	// _txlock=immediate: BEGIN already holds the write lock, before any write.
+	other, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(0)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = other.Close() }()
+	conn, err := other.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	tx, err := store.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(context.Background(), `BEGIN IMMEDIATE`); err == nil {
+		_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		_ = tx.Rollback()
+		t.Fatal("another connection took the write lock while the writer tx was open")
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(context.Background(), `BEGIN IMMEDIATE`); err != nil {
+		t.Fatalf("write lock not released: %v", err)
+	}
+	_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+}
+
+func TestConfigureDataDirChangeRestartsCleanup(t *testing.T) {
+	lifecycle(t)
+	now := time.Now()
+	seedDir := func() string {
+		dir := t.TempDir()
+		seed, err := NewSQLiteStore(filepath.Join(dir, "usage.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		insertAll(t, seed,
+			Record{ID: "old", Timestamp: now.Add(-10 * 24 * time.Hour), AuthIndex: "a", Model: "gone"},
+			Record{ID: "new", Timestamp: now.Add(-time.Hour), AuthIndex: "a", Model: "kept"})
+		if err := seed.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	dirA, dirB := seedDir(), seedDir()
+	configure := func(method, dir string) {
+		t.Helper()
+		errc := make(chan error, 1)
+		go func() {
+			raw, _ := json.Marshal(map[string]any{"config_yaml": "data_dir: '" + dir + "'\nretention_days: 1\n"})
+			_, err := handleMethod(method, raw)
+			errc <- err
+		}()
+		select {
+		case err := <-errc:
+			if err != nil {
+				t.Fatalf("%s %s: %v", method, dir, err)
+			}
+		case <-time.After(15 * time.Second): // timeout guard only: a deadlock
+			t.Fatalf("%s %s did not return", method, dir)
+		}
+	}
+	oldDone := func() chan struct{} { return cleanupChan() }
+	cleaned := func(s *SQLiteStore) bool {
+		return scalarInt(t, s.db, `SELECT COUNT(*) FROM usage_records WHERE id = 'old'`) == 0
+	}
+
+	configure("plugin.register", dirA)
+	storeA, doneA := currentStore(), oldDone()
+	pollUntil(t, "cleanup in dir A", func() bool { return cleaned(storeA) })
+
+	configure("plugin.reconfigure", dirB)
+	storeB, doneB := currentStore(), oldDone()
+	if storeB == nil || storeB == storeA {
+		t.Fatal("store not replaced after data_dir change")
+	}
+	select {
+	case <-doneA:
+	default:
+		t.Fatal("old cleanup goroutine still running after reconfigure")
+	}
+	if doneB == nil || doneB == doneA {
+		t.Fatal("cleanup not restarted for the new store")
+	}
+	pollUntil(t, "cleanup in dir B", func() bool { return cleaned(storeB) })
+	if scalarInt(t, storeB.db, `SELECT COUNT(*) FROM usage_records WHERE id = 'new'`) != 1 {
+		t.Fatal("recent row deleted")
+	}
+	// The old store is closed.
+	if err := storeA.db.Ping(); err == nil {
+		t.Fatal("old store still open")
+	}
+}

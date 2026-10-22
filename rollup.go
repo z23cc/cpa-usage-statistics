@@ -50,6 +50,11 @@ const rollupKeepOnDelete = `COALESCE((SELECT keep_on_delete FROM usage_rollup_co
 // so insert and delete triggers keep the rollups exact. The triggers live in
 // the database: an older plugin version writing after a rollback still keeps
 // the rollups current.
+//
+// The rollups outlive retention, so they are never rebuilt once they exist: a
+// rebuild from the kept details would silently drop all older history. A db
+// that lost only user_version (sqlite3 .dump/.recover reset it) gets it back;
+// rollup data without the triggers is refused instead of being wiped.
 func (s *SQLiteStore) initRollup(ctx context.Context) error {
 	var version int
 	if err := s.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
@@ -63,6 +68,35 @@ func (s *SQLiteStore) initRollup(ctx context.Context) error {
 		return fmt.Errorf("usage sqlite rollup begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	var triggers, tables int
+	if err := tx.QueryRowContext(ctx, `SELECT
+		(SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN ('usage_records_rollup_ai', 'usage_records_rollup_ad')),
+		(SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('usage_hourly', 'usage_daily'))`).Scan(&triggers, &tables); err != nil {
+		return fmt.Errorf("usage sqlite rollup inspect: %w", err)
+	}
+	if triggers == 2 && tables == 2 {
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, rollupSchemaVersion)); err != nil {
+			return fmt.Errorf("usage sqlite rollup version restore: %w", err)
+		}
+		return tx.Commit()
+	}
+	for _, t := range rollupTables {
+		var exists, hasRows int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, t.name).Scan(&exists); err != nil {
+			return fmt.Errorf("usage sqlite rollup inspect: %w", err)
+		}
+		if exists == 0 {
+			continue
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM `+t.name+`)`).Scan(&hasRows); err != nil {
+			return fmt.Errorf("usage sqlite rollup inspect rows: %w", err)
+		}
+		if hasRows != 0 {
+			return fmt.Errorf("usage sqlite: %s holds data but the rollup triggers are missing; refusing to rebuild it "+
+				"from the kept records, which would lose history older than retention_days "+
+				"(drop usage_hourly and usage_daily to rebuild deliberately)", t.name)
+		}
+	}
 	statements := []string{
 		rollupTableDDL(hourlyRollup),
 		rollupTableDDL(dailyRollup),

@@ -24,7 +24,10 @@ const sqliteTimestampLayout = "2006-01-02T15:04:05.000000000Z07:00"
 // a power loss may drop the last commits but never corrupts the database.
 // query_only keeps the read pool from ever writing.
 const (
-	sqliteWriterParams = "?_pragma=busy_timeout(3000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+	// _txlock=immediate takes the write lock at BEGIN; journal_size_limit
+	// truncates the WAL back after a checkpoint (one cleanup batch can grow it).
+	sqliteWriterParams = "?_pragma=busy_timeout(3000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)" +
+		"&_pragma=journal_size_limit(8388608)&_txlock=immediate"
 	sqliteReaderParams = "?_pragma=busy_timeout(3000)&_pragma=query_only(1)"
 	readPoolSize       = 4
 	// cleanupBatchSize bounds how long one retention batch holds the writer.
@@ -348,8 +351,16 @@ func (s *SQLiteStore) AccountSummary(ctx context.Context, rng QueryRange) (Accou
 		return result, err
 	}
 	result.DetailsSince = since
+	// A zero time is an open bound, as in rangeWhere (/usage, /records).
+	start, end := rng.Start, rng.End
+	if start != nil && start.IsZero() {
+		start = nil
+	}
+	if end != nil && end.IsZero() {
+		end = nil
+	}
 	groups := make(map[summaryGroupKey]*summaryGroup)
-	for _, piece := range planSummaryPieces(rng.Start, rng.End, since) {
+	for _, piece := range planSummaryPieces(start, end, since) {
 		if err := scanSummaryPiece(ctx, tx, piece, groups); err != nil {
 			return result, err
 		}
@@ -733,8 +744,14 @@ func (s *SQLiteStore) deleteBatchBefore(ctx context.Context, cutoff string) (int
 		return 0, fmt.Errorf("usage sqlite delete before begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, `UPDATE usage_rollup_control SET keep_on_delete = 1 WHERE id = 1`); err != nil {
+	// Without the control row the trigger would read 0 and retention would
+	// erase rollup history, so refuse instead.
+	flag, err := tx.ExecContext(ctx, `UPDATE usage_rollup_control SET keep_on_delete = 1 WHERE id = 1`)
+	if err != nil {
 		return 0, fmt.Errorf("usage sqlite delete before keep rollups: %w", err)
+	}
+	if n, err := flag.RowsAffected(); err != nil || n != 1 {
+		return 0, fmt.Errorf("usage sqlite delete before: rollup control row missing (%d rows, %v)", n, err)
 	}
 	res, err := tx.ExecContext(ctx,
 		`DELETE FROM usage_records WHERE rowid IN (SELECT rowid FROM usage_records WHERE timestamp < ? ORDER BY timestamp LIMIT ?)`,
@@ -772,7 +789,10 @@ func (s *SQLiteStore) Close() error {
 
 // closeWhenIdle closes db after its running work. db.Close closes only idle
 // connections: a running statement, tx or open rows would keep using usage.db
-// after it returns. Taking every connection first waits for that work.
+// after it returns. Taking every connection first waits for that work. conns
+// must be the pool's MaxOpenConns: below it, Conn opens a fresh connection
+// instead of waiting for a busy one (so idle readers may be opened here only
+// to be closed; that is the price of the guarantee).
 func closeWhenIdle(db *sql.DB, conns int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), insertTimeout)
 	defer cancel()

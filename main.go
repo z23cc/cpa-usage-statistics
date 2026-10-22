@@ -743,6 +743,9 @@ func configurePlugin(request []byte) error {
 		return err
 	}
 	cfg := parseConfig(raw)
+	// Stop the cleanup before ensureStore may close the current store (a
+	// data_dir change), so Close never competes with a running batch.
+	stopCleanup()
 	retentionDays.Store(int64(cfg.RetentionDays))
 	if err := ensureStore(cfg); err != nil {
 		return err
