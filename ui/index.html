@@ -219,7 +219,7 @@
       <input class="field" type="password" id="gateKey" autocomplete="off" placeholder="管理密钥" aria-label="管理密钥" required>
       <button class="btn primary" type="submit">连接</button>
     </form>
-    <p><button class="link" type="button" id="gatePanel" hidden>改用面板里保存的密钥</button></p>
+    <p><button class="link" type="button" id="gatePanel" hidden>我已在面板重新登录，改用新密钥</button></p>
   </div>
 </div>
 
@@ -320,8 +320,18 @@
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i) ^ keyBytes[i % keyBytes.length];
     return new TextDecoder().decode(bytes);
   }
+  // A cheap fingerprint (FNV-1a) of a rejected panel key, so the page skips
+  // exactly that key and picks up a new one after the operator logs in again.
+  function fingerprint(text) {
+    let hash = 0x811c9dc5;
+    for (const byte of new TextEncoder().encode(text)) hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
+    return hash.toString(16);
+  }
   function readPanelKey() {
-    if (storageGet(sessionStorage, SS_PANEL_REJECTED) === '1') return '';
+    const key = readPanelKeyRaw();
+    return key && fingerprint(key) !== storageGet(sessionStorage, SS_PANEL_REJECTED) ? key : '';
+  }
+  function readPanelKeyRaw() {
     try {
       const raw = storageGet(localStorage, PANEL_AUTH_KEY);
       if (raw) {
@@ -340,14 +350,13 @@
     return '';
   }
 
-  const auth = { blocked: false, source: '' };
+  const auth = { blocked: false, source: '', key: '' };
   function currentKey() {
     const panel = readPanelKey();
-    if (panel) { auth.source = 'panel'; return panel; }
     const manual = (storageGet(sessionStorage, SS_MANUAL_KEY) || '').trim();
-    if (manual) { auth.source = 'manual'; return manual; }
-    auth.source = '';
-    return '';
+    auth.source = panel ? 'panel' : manual ? 'manual' : '';
+    auth.key = panel || manual;
+    return auth.key;
   }
 
   class AuthError extends Error {}
@@ -358,20 +367,20 @@
 
   function showGate(message) {
     $('gateWarn').textContent = message || '';
-    $('gatePanel').hidden = storageGet(sessionStorage, SS_PANEL_REJECTED) !== '1';
+    $('gatePanel').hidden = !storageGet(sessionStorage, SS_PANEL_REJECTED);
     $('gate').classList.add('on');
     setTimeout(() => $('gateKey').focus(), 0);
   }
   function hideGate() { $('gate').classList.remove('on'); }
 
-  function onUnauthorized() {
+  function onUnauthorized(rejectedKey, source) {
     // Never retry: each rejected or missing key counts toward the host's IP ban.
-    if (auth.source === 'panel') storageSet(sessionStorage, SS_PANEL_REJECTED, '1');
+    if (source === 'panel') storageSet(sessionStorage, SS_PANEL_REJECTED, fingerprint(rejectedKey));
     else storageDel(sessionStorage, SS_MANUAL_KEY);
     auth.blocked = true;
     for (const controller of inflight) controller.abort();
-    showGate(auth.source === 'panel'
-      ? '面板里保存的管理密钥被拒绝（可能已过期），请输入正确的管理密钥。'
+    showGate(source === 'panel'
+      ? '面板里保存的管理密钥被拒绝（可能已过期）。请在面板重新登录并勾选"记住密码"，或在下面输入正确的管理密钥。'
       : '管理密钥不正确，请重新输入。');
   }
 
@@ -395,6 +404,7 @@
   async function api(path, { method = 'GET', body, params } = {}) {
     if (auth.blocked) throw new AuthError('blocked');
     const key = currentKey();
+    const source = auth.source;
     if (!key) {
       auth.blocked = true;
       showGate('');
@@ -414,10 +424,17 @@
         credentials: 'omit',
         signal: controller.signal,
       });
+    } catch (err) {
+      // Requests aborted because another one hit 401 are part of that auth stop.
+      if (controller.signal.aborted && auth.blocked) throw new AuthError('aborted');
+      throw err;
     } finally {
       inflight.delete(controller);
     }
-    if (res.status === 401) { onUnauthorized(); throw new AuthError('unauthorized'); }
+    if (res.status === 401) {
+      if (!auth.blocked) onUnauthorized(key, source);
+      throw new AuthError('unauthorized');
+    }
     const text = await res.text();
     let data = null;
     try { data = text ? JSON.parse(text) : null; } catch { data = null; }
@@ -437,12 +454,13 @@
   function fmtTokens(n) {
     n = n || 0;
     if (n < 1000) return String(n);
-    if (n < 1e6) return (n / 1e3).toFixed(1) + 'K';
+    if (n < 999950) return (n / 1e3).toFixed(1) + 'K'; // 999950 would round to "1000.0K"
     return (n / 1e6).toFixed(2) + 'M';
   }
   function fmtUSD(v) {
     if (v == null) return '—';
     if (v === 0) return '$0.00';
+    if (Math.abs(v) < 0.00005) return '<$0.0001';
     if (Math.abs(v) < 0.01) return '$' + v.toFixed(4);
     return '$' + v.toFixed(2);
   }
@@ -480,6 +498,13 @@
     selected: null,
     drawer: { cursor: null, done: false, loading: false, gen: 0 },
     loadGen: 0,
+    // What the data on screen covers. The drawer reuses params, so its pages
+    // match the table even if "today" rolls over or another range is pressed.
+    params: null,
+    loadedRange: '',
+    loadedLabel: '',
+    loadedAt: 0,
+    loadError: '',
   };
   if (!['today', 'd7', 'd30', 'custom'].includes(state.range)) state.range = 'today';
   if (state.range === 'custom') state.range = 'today';
@@ -497,6 +522,17 @@
     if (state.custom.end) params.end = toRFC3339(new Date(state.custom.end));
     return params;
   }
+  function rangeKey() {
+    return state.range === 'custom' ? `custom:${state.custom.start}~${state.custom.end}` : state.range;
+  }
+  function rangeLabel() {
+    if (state.range === 'today') return '今天';
+    if (state.range === 'd7') return '近 7 天';
+    if (state.range === 'd30') return '近 30 天';
+    const start = state.custom.start ? fmtShortTime(new Date(state.custom.start).getTime()) : '最早';
+    const end = state.custom.end ? fmtShortTime(new Date(state.custom.end).getTime()) : '现在';
+    return `${start} – ${end}`;
+  }
   function renderRangeButtons() {
     for (const b of $('ranges').querySelectorAll('button')) b.setAttribute('aria-pressed', String(b.dataset.range === state.range));
     $('customRange').classList.toggle('on', state.range === 'custom');
@@ -510,15 +546,37 @@
     if (/quota|\b429\b|rate.?limit/i.test(text)) return '限额';
     return '异常';
   }
+  // CPA also puts a cooldown on credentials that failed with 401/402/403/404, so
+  // a cooldown alone does not mean "will recover": classify it by cause.
+  function cooldownKind(c) {
+    const status = Number(c.http_status) || 0;
+    const reason = String(c.reason || '');
+    if ((status >= 401 && status <= 404) || /unauthori|invalid_grant|invalid_api_key|payment|forbidden|not_found/i.test(reason)) return 'fatal';
+    if (status === 429 || /quota|rate/i.test(reason)) return 'quota';
+    return 'cool';
+  }
+  function fatalLabel(c) {
+    const status = Number(c.http_status) || 0;
+    const reason = String(c.reason || '');
+    if (status === 402 || /payment/i.test(reason)) return '402 欠费';
+    if (status === 403 || /forbidden/i.test(reason)) return '403 拒绝';
+    if (status === 404 || /not_found/i.test(reason)) return '404 不存在';
+    return '401 失效';
+  }
   function credStatus(cred, now) {
     if (!cred) return { level: 'muted', icon: '⊘', label: '已删除', title: '凭证文件已不存在，只剩历史用量', rank: 4 };
     if (cred.disabled || cred.status === 'disabled') return { level: 'muted', icon: '⏸', label: '已停用', title: cred.status_message || '', rank: 3 };
     const cooldowns = (Array.isArray(cred.cooldowns) ? cred.cooldowns : []).filter((c) => Date.parse(c.retry_at) > now);
     if (cooldowns.length) {
+      const describe = (c) => `${c.scope === 'model' ? c.model_key : '整个账号'}：${c.reason || '冷却'}${c.http_status ? ' (' + c.http_status + ')' : ''}，${fmtDateTime(Date.parse(c.retry_at))} 重试`;
+      const title = cooldowns.map(describe).join('\n') + (cred.status_message ? '\n' + cred.status_message : '');
+      const fatal = cooldowns.find((c) => cooldownKind(c) === 'fatal');
+      if (fatal) return { level: 'bad', icon: '✕', label: fatalLabel(fatal), title, rank: 0 };
       const until = Math.max(...cooldowns.map((c) => Date.parse(c.retry_at)));
-      const quota = cooldowns.some((c) => c.http_status === 429 || /quota/i.test(c.reason || ''));
-      const title = cooldowns.map((c) => `${c.scope === 'model' ? c.model_key : '整个账号'}：${c.reason || '冷却'}${c.http_status ? ' (' + c.http_status + ')' : ''}，${fmtDateTime(Date.parse(c.retry_at))} 恢复`).join('\n');
-      return { level: 'warn', icon: '⏳', label: `${quota ? '限额中' : '冷却中'} → ${fmtShortTime(until)}`, title, rank: 1 };
+      const quota = cooldowns.some((c) => cooldownKind(c) === 'quota');
+      const partial = !cred.unavailable && cooldowns.every((c) => c.scope === 'model');
+      const label = `${partial ? '部分模型' : ''}${quota ? '限额' : '冷却'}${partial ? '' : '中'} → ${fmtShortTime(until)}`;
+      return { level: 'warn', icon: '⏳', label, title, rank: 1 };
     }
     if (cred.status === 'error' || cred.unavailable) {
       return { level: 'bad', icon: '✕', label: shortStatusMessage(cred.status_message), title: cred.status_message || '', rank: 0 };
@@ -559,9 +617,12 @@
     else if (isApiKey) status = { level: 'muted', icon: '⚿', label: 'API Key', title: '配置文件里的 API Key，凭证接口不提供它的状态', rank: 3 };
     else status = credStatus(cred, now);
     const t = (usage && usage.tokens) || {};
+    const authIndex = (usage && usage.auth_index) || (cred && cred.auth_index) || '';
     return {
-      key: (usage ? usage.auth_index + '|' + usage.auth_id : 'cred|' + cred.auth_index),
-      authIndex: (usage && usage.auth_index) || (cred && cred.auth_index) || '',
+      // Keyed by auth_index so a row keeps its identity (and an open drawer)
+      // when an idle credential gets its first usage.
+      key: authIndex ? 'i|' + authIndex : 'a|' + ((usage && usage.auth_id) || ''),
+      authIndex,
       authId: (usage && usage.auth_id) || '',
       label, file,
       provider: (usage && usage.provider) || (cred && (cred.provider || cred.type)) || '',
@@ -642,7 +703,8 @@
     const body = $('accountsBody');
     const rows = visibleRows();
     if (!state.accounts) {
-      body.replaceChildren(h('tr', null, h('td', { colspan: COLUMNS.length, class: 'empty', text: '加载中…' })));
+      const text = state.loadError ? `加载失败：${state.loadError}` : '加载中…';
+      body.replaceChildren(h('tr', null, h('td', { colspan: COLUMNS.length, class: 'empty', text })));
       $('tableFoot').textContent = '';
       return;
     }
@@ -672,7 +734,8 @@
       }));
     }
     const withUsage = state.rows.filter((r) => r.requests).length;
-    $('tableFoot').textContent = `显示 ${rows.length} / ${state.rows.length} 个账号，其中 ${withUsage} 个在所选时间段有用量。点击一行查看逐条明细。`;
+    const stale = state.loadError ? `刷新失败，下面是 ${fmtDateTime(state.loadedAt, true)} 的数据。` : '';
+    $('tableFoot').textContent = `${stale}显示 ${rows.length} / ${state.rows.length} 个账号，其中 ${withUsage} 个在「${state.loadedLabel}」有用量。点击一行查看逐条明细。`;
   }
 
   function renderTiles() {
@@ -715,11 +778,14 @@
   async function load() {
     if (auth.blocked) return;
     const gen = ++state.loadGen;
+    const params = rangeParams();
+    const requested = rangeKey();
+    const label = rangeLabel();
     hideBanner();
     $('refresh').disabled = true;
     try {
       // Sequential on purpose: if the key is bad, only one request is rejected.
-      const accounts = await api(API.accounts, { params: rangeParams() });
+      const accounts = await api(API.accounts, { params });
       let creds = [];
       let credsOk = true;
       try {
@@ -730,20 +796,30 @@
         credsOk = false;
       }
       if (gen !== state.loadGen) return;
-      state.accounts = accounts;
-      state.creds = creds;
-      state.credsOk = credsOk;
+      Object.assign(state, {
+        accounts, creds, credsOk, params,
+        loadedRange: requested, loadedLabel: label, loadedAt: Date.now(), loadError: '',
+      });
       buildRows();
       renderTiles();
       renderTable();
-      $('updated').textContent = '更新于 ' + fmtClock(Date.now()) + ':' + pad(new Date().getSeconds());
+      $('updated').textContent = `「${label}」· 更新于 ${fmtDateTime(state.loadedAt, true).slice(11)}`;
       if (state.selected) {
         const row = state.rows.find((r) => r.key === state.selected);
         if (row) openDrawer(row.key, true); else closeDrawer();
       }
     } catch (err) {
       if (err instanceof AuthError || gen !== state.loadGen) return;
-      showBanner(errorText(err));
+      state.loadError = errorText(err);
+      if (state.loadedRange !== requested) {
+        // Never show another range's numbers under the newly pressed range.
+        Object.assign(state, { accounts: null, rows: [], params: null, loadedRange: '', loadedLabel: '' });
+        closeDrawer();
+        $('updated').textContent = '';
+      }
+      renderTiles();
+      renderTable();
+      showBanner(state.loadError);
     } finally {
       if (gen === state.loadGen) $('refresh').disabled = false;
     }
@@ -781,6 +857,12 @@
     state.drawer = { cursor: null, done: false, loading: false, gen: state.drawer.gen + 1 };
     $('dRows').replaceChildren();
     if (!row.usage) { $('dSentinel').textContent = ''; state.drawer.done = true; return; }
+    if (!row.authIndex && !row.authId) {
+      // Without either filter /records would return every account's records.
+      $('dSentinel').textContent = '这组用量没有账号标识，无法单独列出明细。';
+      state.drawer.done = true;
+      return;
+    }
     loadMoreRecords();
   }
 
@@ -818,15 +900,18 @@
 
   async function loadMoreRecords() {
     const d = state.drawer;
-    if (d.loading || d.done || !state.selected || auth.blocked) return;
+    if (d.loading || d.done || !state.selected || !state.params || auth.blocked) return;
     const row = state.rows.find((r) => r.key === state.selected);
-    if (!row) return;
+    if (!row || (!row.authIndex && !row.authId)) return;
     const gen = d.gen;
     d.loading = true;
     $('dSentinel').textContent = '加载中…';
     try {
-      const params = Object.assign({ limit: RECORDS_PAGE }, rangeParams());
-      if (row.authIndex) params.auth_index = row.authIndex; else params.auth_id = row.authId;
+      // Same range as the table (fixed at load time), and both identifiers so
+      // the filter matches exactly one usage group.
+      const params = Object.assign({ limit: RECORDS_PAGE }, state.params);
+      if (row.authIndex) params.auth_index = row.authIndex;
+      if (row.authId) params.auth_id = row.authId;
       if (d.cursor) params.cursor = d.cursor;
       const page = await api(API.records, { params });
       if (gen !== state.drawer.gen) return;
@@ -837,7 +922,8 @@
       if (!d.done) $('dSentinel').append(h('button', { class: 'btn', type: 'button', onclick: loadMoreRecords }, '加载更多'));
     } catch (err) {
       if (gen !== state.drawer.gen) return;
-      $('dSentinel').replaceChildren(err instanceof AuthError ? '' : errorText(err), err instanceof AuthError ? '' : h('button', { class: 'btn', type: 'button', onclick: loadMoreRecords }, '重试'));
+      if (err instanceof AuthError) $('dSentinel').replaceChildren();
+      else $('dSentinel').replaceChildren(errorText(err), ' ', h('button', { class: 'btn', type: 'button', onclick: loadMoreRecords }, '重试'));
     } finally {
       if (gen === state.drawer.gen) d.loading = false;
     }
@@ -862,22 +948,36 @@
     tr.addEventListener('input', () => tr.classList.remove('unset'));
     return tr;
   }
+  // PUT replaces the whole table, so editing is only allowed on top of a
+  // successfully loaded copy; otherwise one click could wipe every price.
+  const priceEditor = { ready: false, gen: 0, serverModels: new Set() };
+  function setPriceEditorReady(ready) {
+    priceEditor.ready = ready;
+    for (const id of ['priceSave', 'priceAdd', 'priceImport']) $(id).disabled = !ready;
+  }
   async function openPrices() {
     const dlg = $('prices');
+    const gen = ++priceEditor.gen;
+    setPriceEditorReady(false);
     $('priceNote').textContent = '加载中…';
     $('priceNote').classList.remove('err');
     $('priceRows').replaceChildren();
     if (!dlg.open) dlg.showModal();
     try {
       const res = await api(API.prices);
+      if (gen !== priceEditor.gen || !dlg.open) return;
       const byModel = new Map(res.prices.map((p) => [p.model, p]));
       const models = [...new Set([...res.prices.map((p) => p.model), ...res.models_seen])].sort();
       $('priceRows').replaceChildren(...models.map((m) => priceRow(m, byModel.get(m), true)));
+      priceEditor.serverModels = new Set(byModel.keys());
       const missing = res.models_seen.filter((m) => !byModel.has(m)).length;
       $('priceNote').textContent = missing ? `${missing} 个出现过的模型还没有单价（黄色行）` : '';
+      setPriceEditorReady(true);
     } catch (err) {
+      if (gen !== priceEditor.gen) return;
       if (err instanceof AuthError) { dlg.close(); return; }
-      $('priceNote').textContent = errorText(err);
+      $('priceNote').replaceChildren('单价没有加载成功，暂时不能保存：' + errorText(err) + ' ',
+        h('button', { class: 'link', type: 'button', onclick: openPrices, text: '重新加载' }));
       $('priceNote').classList.add('err');
     }
   }
@@ -887,6 +987,8 @@
     for (const tr of $('priceRows').querySelectorAll('tr')) {
       const model = tr.querySelector('input.model').value.trim();
       const inputs = [...tr.querySelectorAll('input[data-field]')];
+      // A number input reports unparsable text ("1,5") as an empty value.
+      if (inputs.some((i) => i.validity.badInput)) throw new Error(`${model || '新模型'} 有单价不是有效数字`);
       if (inputs.every((i) => i.value.trim() === '')) continue; // blank row = unpriced
       if (!model) throw new Error('有一行没填模型名');
       if ([...model].length > 200) throw new Error(`模型名太长：${model.slice(0, 40)}…`);
@@ -904,12 +1006,16 @@
     return out;
   }
   async function savePrices() {
+    if (!priceEditor.ready) return;
     let prices;
     try { prices = collectPrices(); } catch (err) {
       $('priceNote').textContent = err.message;
       $('priceNote').classList.add('err');
       return;
     }
+    const kept = new Set(prices.map((p) => p.model));
+    const removed = [...priceEditor.serverModels].filter((m) => !kept.has(m));
+    if (removed.length && !window.confirm(`保存后会删除这些模型的单价，它们的花费将不再计算：\n${removed.join('\n')}\n\n确定保存吗？`)) return;
     $('priceSave').disabled = true;
     $('priceNote').classList.remove('err');
     $('priceNote').textContent = '保存中…';
@@ -922,21 +1028,27 @@
       $('priceNote').textContent = errorText(err);
       $('priceNote').classList.add('err');
     } finally {
-      $('priceSave').disabled = false;
+      $('priceSave').disabled = !priceEditor.ready;
     }
   }
   function importPanelPrices() {
+    if (!priceEditor.ready) return;
     let data = null;
     try { data = JSON.parse(storageGet(localStorage, PANEL_PRICES_KEY) || 'null'); } catch { data = null; }
     const entries = [];
+    const num = (...values) => { for (const v of values) if (v != null && Number.isFinite(Number(v))) return Math.max(Number(v), 0); return null; };
     if (data && typeof data === 'object') {
       const list = Array.isArray(data) ? data.map((p) => [p && (p.model || p.name), p]) : Object.entries(data);
       for (const [model, p] of list) {
         if (!model || !p || typeof p !== 'object') continue;
-        entries.push([String(model).trim(), {
-          input: Number(p.input) || 0, output: Number(p.output) || 0,
-          cache_read: Number(p.cacheRead ?? p.cache_read) || 0, cache_creation: Number(p.cacheCreate ?? p.cache_creation) || 0,
-        }]);
+        // Current panel fields, plus the legacy {prompt, completion, cache} shape it still migrates.
+        const price = {
+          input: num(p.input, p.prompt), output: num(p.output, p.completion),
+          cache_read: num(p.cacheRead, p.cache_read, p.cache), cache_creation: num(p.cacheCreate, p.cache_creation),
+        };
+        if (Object.values(price).every((v) => v == null)) continue; // nothing recognisable: leave it unpriced
+        for (const k of Object.keys(price)) if (price[k] == null) price[k] = 0;
+        entries.push([String(model).trim(), price]);
       }
     }
     if (!entries.length) {
@@ -964,11 +1076,13 @@
     load();
   });
   $('applyCustom').addEventListener('click', () => {
-    state.custom = { start: $('customStart').value, end: $('customEnd').value };
-    if (state.custom.start && state.custom.end && new Date(state.custom.start) >= new Date(state.custom.end)) {
+    const start = $('customStart').value;
+    const end = $('customEnd').value;
+    if (start && end && new Date(start) >= new Date(end)) {
       showBanner('结束时间必须晚于开始时间');
       return;
     }
+    state.custom = { start, end };
     load();
   });
   $('search').addEventListener('input', (e) => { state.search = e.target.value; renderTable(); });
@@ -994,17 +1108,21 @@
     e.preventDefault();
     const key = $('gateKey').value.trim();
     if (!key) return;
+    // Header values must be printable ASCII; some browsers echo a bad value
+    // (the key) in the fetch error, which the banner would then display.
+    if (!/^[\x21-\x7e]+$/.test(key)) { $('gateWarn').textContent = '管理密钥只能包含可见的 ASCII 字符。'; return; }
     storageSet(sessionStorage, SS_MANUAL_KEY, key);
-    // A typed key wins over a panel key that was already rejected.
-    storageSet(sessionStorage, SS_PANEL_REJECTED, '1');
     $('gateKey').value = '';
     auth.blocked = false;
     hideGate();
     load();
   });
+  // Checks the panel's stored key locally; it only unblocks when the key differs
+  // from the rejected one, so clicking it never costs a failed attempt.
   $('gatePanel').addEventListener('click', () => {
-    storageDel(sessionStorage, SS_PANEL_REJECTED);
-    if (!readPanelKey()) { showGate('面板里没有保存密钥（登录时没有勾选"记住密码"）。'); return; }
+    const raw = readPanelKeyRaw();
+    if (!raw) { $('gateWarn').textContent = '面板里没有保存密钥（登录时没有勾选"记住密码"）。'; return; }
+    if (!readPanelKey()) { $('gateWarn').textContent = '面板里保存的还是被拒绝的那个密钥，请先在面板重新登录。'; return; }
     auth.blocked = false;
     hideGate();
     load();
