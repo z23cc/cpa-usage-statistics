@@ -1,15 +1,1020 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>账号用量</title>
 <style>
-  body { margin: 0; padding: 24px; font: 14px/1.5 system-ui, sans-serif; background: #f6f7f9; color: #1f2328; }
-  @media (prefers-color-scheme: dark) { body { background: #0d1117; color: #e6edf3; } }
+  /* Colors mirror the management panel's themes.scss so the iframe blends in. */
+  :root, [data-theme="light"] {
+    --bg: #faf9f5; --surface: #f0eee8; --surface-2: #e9e6df; --raised: #fffdf9;
+    --text: #2d2a26; --text-2: #6d6760; --text-3: #a29c95;
+    --border: #e3e1db; --border-strong: #d5d2cb;
+    --accent: #8b8680; --accent-hover: #7f7a74; --on-accent: #ffffff;
+    --good-bg: #d1fae5; --good-text: #065f46; --good-border: #6ee7b7;
+    --warn-bg: color-mix(in srgb, #d97706 12%, transparent); --warn-text: #92400e; --warn-border: color-mix(in srgb, #d97706 35%, transparent);
+    --bad-bg: rgba(198, 87, 70, 0.14); --bad-text: #8a3a30; --bad-border: rgba(198, 87, 70, 0.35);
+    --muted-bg: rgba(139, 134, 128, 0.16); --muted-text: #6d6760; --muted-border: rgba(139, 134, 128, 0.3);
+    --selected: color-mix(in srgb, #8b8680 14%, transparent);
+    --shadow: 0 12px 26px rgba(0, 0, 0, 0.14);
+  }
+  [data-theme="white"] {
+    --bg: #ffffff; --surface: #ffffff; --surface-2: #f6f6f6; --raised: #ffffff;
+    --border: #e5e5e5; --border-strong: #d9d9d9;
+  }
+  [data-theme="dark"] {
+    --bg: #151412; --surface: #1d1b18; --surface-2: #262320; --raised: #2a2723;
+    --text: #f6f4f1; --text-2: #c9c3bb; --text-3: #9c958d;
+    --border: #3a3530; --border-strong: #4a453f;
+    --accent: #8b8680; --accent-hover: #9a948e; --on-accent: #ffffff;
+    --good-bg: rgba(6, 78, 59, 0.3); --good-text: #6ee7b7; --good-border: #059669;
+    --warn-bg: color-mix(in srgb, #d97706 22%, transparent); --warn-text: #fcd34d; --warn-border: color-mix(in srgb, #d97706 50%, transparent);
+    --bad-bg: rgba(198, 87, 70, 0.24); --bad-text: #f1b0a6; --bad-border: rgba(198, 87, 70, 0.5);
+    --muted-bg: rgba(139, 134, 128, 0.28); --muted-text: #c9c3bb; --muted-border: rgba(139, 134, 128, 0.45);
+    --selected: color-mix(in srgb, #8b8680 26%, transparent);
+    --shadow: 0 14px 30px rgba(0, 0, 0, 0.4);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  button, input { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .num { font-variant-numeric: tabular-nums; }
+  .muted { color: var(--text-3); }
+  .sub { color: var(--text-2); }
+
+  .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  /* The panel floats its own toolbar over the top-right of plugin pages. */
+  .embedded .bar { padding-right: 216px; }
+  .bar h1 { font-size: 15px; margin: 0 8px 0 0; font-weight: 600; }
+  .seg { display: inline-flex; border: 1px solid var(--border-strong); border-radius: 8px; overflow: hidden; }
+  .seg button { border: 0; background: var(--surface); padding: 4px 10px; }
+  .seg button + button { border-left: 1px solid var(--border-strong); }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); }
+  .field { border: 1px solid var(--border-strong); border-radius: 8px; background: var(--raised); padding: 4px 8px; min-width: 0; }
+  .btn { border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface); padding: 4px 12px; }
+  .btn:hover { background: var(--surface-2); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+  .btn.primary:hover { background: var(--accent-hover); }
+  .btn:disabled { opacity: 0.55; cursor: default; }
+  .spacer { flex: 1; }
+  .custom-range { display: none; align-items: center; gap: 6px; }
+  .custom-range.on { display: inline-flex; }
+  label.check { display: inline-flex; align-items: center; gap: 4px; color: var(--text-2); }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; padding: 12px 16px 4px; }
+  .tile { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+  .tile .k { color: var(--text-2); font-size: 12px; }
+  .tile .v { font-size: 22px; font-weight: 600; margin-top: 2px; }
+  .tile .d { color: var(--text-2); font-size: 12px; margin-top: 2px; }
+  .link { background: none; border: 0; padding: 0; color: var(--text); text-decoration: underline; }
+
+  .banner { display: none; margin: 8px 16px 0; padding: 8px 12px; border-radius: 8px; background: var(--bad-bg); color: var(--bad-text); border: 1px solid var(--bad-border); }
+  .banner.on { display: flex; align-items: center; gap: 8px; }
+
+  .main { flex: 1; min-height: 0; display: flex; padding: 8px 16px 12px; gap: 12px; position: relative; }
+  .table-wrap { flex: 1; min-width: 0; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--raised); }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 7px 8px; border-bottom: 1px solid var(--border); text-align: right; white-space: nowrap; }
+  th:first-child, td:first-child, th.left, td.left { text-align: left; }
+  thead th { position: sticky; top: 0; background: var(--surface); z-index: 1; font-weight: 600; color: var(--text-2); }
+  th button { background: none; border: 0; padding: 0; font-weight: 600; color: inherit; }
+  th[aria-sort="ascending"] button::after { content: " ▲"; }
+  th[aria-sort="descending"] button::after { content: " ▼"; }
+  tbody tr.row { cursor: pointer; }
+  tbody tr.row:hover { background: var(--surface-2); }
+  tbody tr.row[aria-selected="true"] { background: var(--selected); }
+  tbody tr.idle td { color: var(--text-3); }
+  .acct { display: flex; flex-direction: column; max-width: 260px; }
+  .acct span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .acct .file { color: var(--text-3); font-size: 11px; }
+  .badge { display: inline-flex; align-items: center; gap: 4px; padding: 1px 8px; border-radius: 999px; border: 1px solid; font-size: 12px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+  .badge.good { background: var(--good-bg); color: var(--good-text); border-color: var(--good-border); }
+  .badge.warn { background: var(--warn-bg); color: var(--warn-text); border-color: var(--warn-border); }
+  .badge.bad { background: var(--bad-bg); color: var(--bad-text); border-color: var(--bad-border); }
+  .badge.muted { background: var(--muted-bg); color: var(--muted-text); border-color: var(--muted-border); }
+  .table-foot { padding: 6px 10px; color: var(--text-3); }
+  .empty { padding: 32px; text-align: center; color: var(--text-3); }
+
+  /* The drawer floats over the right of the table so the table keeps its width. */
+  .drawer { position: absolute; top: 8px; right: 16px; bottom: 12px; width: min(640px, 64%); z-index: 3; display: none; flex-direction: column; min-height: 0; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--raised); box-shadow: var(--shadow); }
+  .drawer.on { display: flex; }
+  .drawer-head { padding: 10px 12px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; align-items: flex-start; }
+  .drawer-head .title { font-weight: 600; word-break: break-all; }
+  .drawer-head .meta { color: var(--text-2); font-size: 12px; margin-top: 2px; word-break: break-all; }
+  .drawer-sum { display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 8px 12px; border-bottom: 1px solid var(--border); color: var(--text-2); }
+  .drawer-sum b { color: var(--text); font-weight: 600; }
+  .drawer-body { flex: 1; min-height: 0; overflow: auto; }
+  .drawer-body th, .drawer-body td { padding: 6px 8px; font-size: 12px; }
+  tr.fail td.res { color: var(--bad-text); }
+  tr.fail { cursor: pointer; }
+  tr.detail td { white-space: normal; text-align: left; background: var(--surface); }
+  pre.body { margin: 0; max-height: 240px; overflow: auto; white-space: pre-wrap; word-break: break-all; font: 12px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  .sentinel { padding: 10px; text-align: center; color: var(--text-3); }
+  .x { border: 0; background: none; font-size: 18px; line-height: 1; padding: 0 4px; color: var(--text-2); }
+
+  .gate { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: color-mix(in srgb, var(--bg) 88%, transparent); z-index: 10; }
+  .gate.on { display: flex; }
+  .card { width: min(440px, calc(100% - 32px)); background: var(--raised); border: 1px solid var(--border); border-radius: 12px; padding: 18px; box-shadow: var(--shadow); }
+  .card h2 { font-size: 15px; margin: 0 0 8px; }
+  .card p { margin: 6px 0; color: var(--text-2); }
+  .card .warn-text { color: var(--bad-text); }
+  .card form { display: flex; gap: 8px; margin-top: 10px; }
+  .card form input { flex: 1; }
+
+  dialog { border: 1px solid var(--border); border-radius: 12px; background: var(--raised); color: var(--text); padding: 0; width: min(860px, calc(100% - 32px)); max-height: calc(100% - 32px); box-shadow: var(--shadow); }
+  dialog::backdrop { background: rgba(0, 0, 0, 0.35); }
+  .dlg { display: flex; flex-direction: column; max-height: calc(100vh - 64px); }
+  .dlg-head, .dlg-foot { padding: 12px 16px; display: flex; align-items: center; gap: 8px; }
+  .dlg-head { border-bottom: 1px solid var(--border); }
+  .dlg-foot { border-top: 1px solid var(--border); }
+  .dlg-body { overflow: auto; padding: 8px 16px; }
+  .dlg-body table input { width: 96px; text-align: right; }
+  .dlg-body table input.model { width: 100%; min-width: 220px; text-align: left; }
+  .note { color: var(--text-2); font-size: 12px; }
+  .note.err { color: var(--bad-text); }
+  .unset td { background: var(--warn-bg); }
+
+  @media (max-width: 900px) {
+    .drawer { left: 16px; width: auto; }
+    .embedded .bar { padding-right: 16px; padding-top: 56px; }
+  }
 </style>
 </head>
 <body>
-<p>账号用量页面：插件后端已就绪，页面在下一步实现。</p>
+<header class="bar">
+  <h1>账号用量</h1>
+  <div class="seg" role="group" aria-label="时间范围" id="ranges">
+    <button type="button" data-range="today">今天</button>
+    <button type="button" data-range="d7">近 7 天</button>
+    <button type="button" data-range="d30">近 30 天</button>
+    <button type="button" data-range="custom">自定义</button>
+  </div>
+  <span class="custom-range" id="customRange">
+    <input class="field" type="datetime-local" id="customStart" aria-label="开始时间">
+    <span class="muted">至</span>
+    <input class="field" type="datetime-local" id="customEnd" aria-label="结束时间（留空为现在）">
+    <button class="btn" type="button" id="applyCustom">应用</button>
+  </span>
+  <input class="field" type="search" id="search" placeholder="搜索邮箱 / 文件名" aria-label="搜索账号">
+  <label class="check"><input type="checkbox" id="hideIdle"> 隐藏无用量账号</label>
+  <span class="spacer"></span>
+  <span class="muted" id="updated"></span>
+  <button class="btn" type="button" id="openPrices">单价设置</button>
+  <button class="btn" type="button" id="refresh">刷新</button>
+</header>
+
+<section class="tiles" aria-label="所选时间段合计">
+  <div class="tile"><div class="k">有用量的账号</div><div class="v num" id="tAccounts">—</div><div class="d" id="tAccountsD"></div></div>
+  <div class="tile"><div class="k">请求次数</div><div class="v num" id="tRequests">—</div><div class="d" id="tRequestsD"></div></div>
+  <div class="tile"><div class="k">总 token</div><div class="v num" id="tTokens">—</div><div class="d" id="tTokensD"></div></div>
+  <div class="tile"><div class="k">花费（按设置的单价估算）</div><div class="v num" id="tCost">—</div><div class="d" id="tCostD"></div></div>
+</section>
+
+<div class="banner" id="banner" role="alert"><span id="bannerText"></span><span class="spacer"></span><button class="btn" type="button" id="bannerRetry">重试</button></div>
+
+<div class="main">
+  <div class="table-wrap">
+    <table id="accounts" aria-label="账号用量">
+      <thead><tr id="accountsHead"></tr></thead>
+      <tbody id="accountsBody"></tbody>
+    </table>
+    <div class="table-foot" id="tableFoot"></div>
+  </div>
+  <aside class="drawer" id="drawer" aria-label="账号明细">
+    <div class="drawer-head">
+      <div style="flex:1;min-width:0">
+        <div class="title" id="dTitle"></div>
+        <div class="meta" id="dMeta"></div>
+      </div>
+      <span id="dStatus"></span>
+      <button class="x" type="button" id="dClose" aria-label="关闭明细">×</button>
+    </div>
+    <div class="drawer-sum" id="dSum"></div>
+    <div class="drawer-body" id="dBody">
+      <table aria-label="请求明细">
+        <thead><tr>
+          <th class="left">时间</th><th class="left">模型</th><th class="left">结果</th><th>耗时</th><th>首字</th>
+          <th title="输入（含缓存） / 缓存读取 / 输出（含推理）">输入 / 缓存 / 输出</th><th>花费</th>
+        </tr></thead>
+        <tbody id="dRows"></tbody>
+      </table>
+      <div class="sentinel" id="dSentinel"></div>
+    </div>
+  </aside>
+</div>
+
+<div class="gate" id="gate">
+  <div class="card" role="dialog" aria-modal="true" aria-labelledby="gateTitle">
+    <h2 id="gateTitle">需要管理密钥</h2>
+    <p class="warn-text" id="gateWarn"></p>
+    <p>在面板登录时勾选"记住密码"，这里会自动使用面板保存的密钥。也可以在下面输入 CLIProxyAPI 管理密钥，只保存在当前浏览器标签页。</p>
+    <p class="muted">连续 5 次缺失或错误的密钥会让当前 IP 被封 30 分钟，本页不会自动重试。</p>
+    <form id="gateForm">
+      <input class="field" type="password" id="gateKey" autocomplete="off" placeholder="管理密钥" aria-label="管理密钥" required>
+      <button class="btn primary" type="submit">连接</button>
+    </form>
+    <p><button class="link" type="button" id="gatePanel" hidden>改用面板里保存的密钥</button></p>
+  </div>
+</div>
+
+<dialog id="prices" aria-labelledby="pricesTitle">
+  <div class="dlg">
+    <div class="dlg-head"><b id="pricesTitle">单价设置</b><span class="note">美元 / 百万 token，与面板相同；只填有价格的模型，留空的模型不计花费</span><span class="spacer"></span><button class="x" type="button" id="pricesClose" aria-label="关闭">×</button></div>
+    <div class="dlg-body">
+      <table aria-label="模型单价">
+        <thead><tr><th class="left">模型</th><th>输入</th><th>输出</th><th>缓存读取</th><th>缓存创建</th><th></th></tr></thead>
+        <tbody id="priceRows"></tbody>
+      </table>
+    </div>
+    <div class="dlg-foot">
+      <button class="btn" type="button" id="priceAdd">添加模型</button>
+      <button class="btn" type="button" id="priceImport">从面板导入</button>
+      <span class="note" id="priceNote"></span>
+      <span class="spacer"></span>
+      <button class="btn" type="button" id="priceCancel">取消</button>
+      <button class="btn primary" type="button" id="priceSave">保存</button>
+    </div>
+  </div>
+</dialog>
+
+<script>
+'use strict';
+(() => {
+  const API = {
+    accounts: '/v0/management/plugins/usage-statistics/accounts',
+    records: '/v0/management/plugins/usage-statistics/records',
+    prices: '/v0/management/plugins/usage-statistics/prices',
+    credentials: '/v8/management/credentials',
+  };
+  const SS_MANUAL_KEY = 'usage-ui:manual-key';
+  const SS_PANEL_REJECTED = 'usage-ui:panel-key-rejected';
+  const LS_RANGE = 'usage-ui:range';
+  const PANEL_AUTH_KEY = 'cli-proxy-auth';
+  const PANEL_PRICES_KEY = 'cli-proxy-model-prices';
+  const RECORDS_PAGE = 100;
+  const FAILURE_PREVIEW = 4000;
+
+  const $ = (id) => document.getElementById(id);
+
+  // ---- tiny DOM helper: strings always become text nodes, never HTML ----
+  function h(tag, props, ...children) {
+    const el = document.createElement(tag);
+    if (props) {
+      for (const [k, v] of Object.entries(props)) {
+        if (v == null || v === false) continue;
+        if (k === 'class') el.className = v;
+        else if (k === 'text') el.textContent = v;
+        else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+        else if (k in el && typeof v !== 'string') el[k] = v;
+        else el.setAttribute(k, v === true ? '' : String(v));
+      }
+    }
+    for (const c of children.flat()) {
+      if (c == null || c === false) continue;
+      el.append(c instanceof Node ? c : document.createTextNode(String(c)));
+    }
+    return el;
+  }
+
+  function storageGet(store, key) { try { return store.getItem(key); } catch { return null; } }
+  function storageSet(store, key, value) { try { store.setItem(key, value); } catch { /* storage may be blocked */ } }
+  function storageDel(store, key) { try { store.removeItem(key); } catch { /* storage may be blocked */ } }
+
+  // ---- theme: follow the panel's data-theme when embedded, else the system ----
+  function applyTheme() {
+    let theme = null;
+    let embedded = false;
+    try {
+      if (window.parent && window.parent !== window) {
+        embedded = true;
+        theme = window.parent.document.documentElement.getAttribute('data-theme');
+      }
+    } catch { embedded = false; }
+    if (!embedded) theme = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    document.documentElement.setAttribute('data-theme', theme === 'dark' || theme === 'white' ? theme : 'light');
+  }
+  applyTheme();
+  try {
+    if (window.parent && window.parent !== window) {
+      document.documentElement.classList.add('embedded');
+      new MutationObserver(applyTheme).observe(window.parent.document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    }
+  } catch { /* cross-origin parent: keep current theme */ }
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
+
+  // ---- management key ----
+  // The panel persists its zustand auth store under cli-proxy-auth, XOR-obfuscated
+  // (see the panel's src/utils/encryption.ts); managementKey is present only when
+  // "remember password" was ticked. This is obfuscation, not a security boundary.
+  function deobfuscate(value) {
+    if (!value.startsWith('enc::v1::')) return value;
+    const keyBytes = new TextEncoder().encode(`cli-proxy-api-webui::secure-storage|${location.host}|${navigator.userAgent}`);
+    const binary = atob(value.slice('enc::v1::'.length));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i) ^ keyBytes[i % keyBytes.length];
+    return new TextDecoder().decode(bytes);
+  }
+  function readPanelKey() {
+    if (storageGet(sessionStorage, SS_PANEL_REJECTED) === '1') return '';
+    try {
+      const raw = storageGet(localStorage, PANEL_AUTH_KEY);
+      if (raw) {
+        const data = JSON.parse(deobfuscate(raw));
+        const key = data && data.state && data.state.managementKey;
+        if (typeof key === 'string' && key.trim()) return key.trim();
+      }
+      const legacy = storageGet(localStorage, 'managementKey');
+      if (legacy) {
+        const text = deobfuscate(legacy);
+        let key = text;
+        try { key = JSON.parse(text); } catch { /* plain string */ }
+        if (typeof key === 'string' && key.trim()) return key.trim();
+      }
+    } catch { /* unreadable panel storage: fall back to manual entry */ }
+    return '';
+  }
+
+  const auth = { blocked: false, source: '' };
+  function currentKey() {
+    const panel = readPanelKey();
+    if (panel) { auth.source = 'panel'; return panel; }
+    const manual = (storageGet(sessionStorage, SS_MANUAL_KEY) || '').trim();
+    if (manual) { auth.source = 'manual'; return manual; }
+    auth.source = '';
+    return '';
+  }
+
+  class AuthError extends Error {}
+  class ApiError extends Error {
+    constructor(status, message) { super(message); this.status = status; }
+  }
+  const inflight = new Set();
+
+  function showGate(message) {
+    $('gateWarn').textContent = message || '';
+    $('gatePanel').hidden = storageGet(sessionStorage, SS_PANEL_REJECTED) !== '1';
+    $('gate').classList.add('on');
+    setTimeout(() => $('gateKey').focus(), 0);
+  }
+  function hideGate() { $('gate').classList.remove('on'); }
+
+  function onUnauthorized() {
+    // Never retry: each rejected or missing key counts toward the host's IP ban.
+    if (auth.source === 'panel') storageSet(sessionStorage, SS_PANEL_REJECTED, '1');
+    else storageDel(sessionStorage, SS_MANUAL_KEY);
+    auth.blocked = true;
+    for (const controller of inflight) controller.abort();
+    showGate(auth.source === 'panel'
+      ? '面板里保存的管理密钥被拒绝（可能已过期），请输入正确的管理密钥。'
+      : '管理密钥不正确，请重新输入。');
+  }
+
+  // The host HTML-escapes every string in plugin JSON responses for schema
+  // versions below 6 (Go html.EscapeString). Keeping schema 1 keeps /usage
+  // byte-identical for the panel, so undo exactly those five entities here.
+  // One regex pass is the precise inverse, e.g. "&amp;lt;" -> "&lt;".
+  const ENTITIES = { '&lt;': '<', '&gt;': '>', '&#34;': '"', '&#39;': "'", '&amp;': '&' };
+  function unescapeStrings(value) {
+    if (typeof value === 'string') return value.replace(/&(?:lt|gt|#34|#39|amp);/g, (m) => ENTITIES[m]);
+    if (Array.isArray(value)) return value.map(unescapeStrings);
+    if (value && typeof value === 'object') {
+      const out = {};
+      for (const [k, v] of Object.entries(value)) out[k] = unescapeStrings(v);
+      return out;
+    }
+    return value;
+  }
+  const isPluginPath = (path) => path.startsWith('/v0/management/plugins/usage-statistics/');
+
+  async function api(path, { method = 'GET', body, params } = {}) {
+    if (auth.blocked) throw new AuthError('blocked');
+    const key = currentKey();
+    if (!key) {
+      auth.blocked = true;
+      showGate('');
+      throw new AuthError('no key');
+    }
+    const url = new URL(path, location.origin);
+    if (params) for (const [k, v] of Object.entries(params)) if (v != null && v !== '') url.searchParams.set(k, v);
+    const controller = new AbortController();
+    inflight.add(controller);
+    let res;
+    try {
+      res = await fetch(url, {
+        method,
+        headers: Object.assign({ Authorization: 'Bearer ' + key }, body ? { 'Content-Type': 'application/json' } : {}),
+        body: body ? JSON.stringify(body) : undefined,
+        cache: 'no-store',
+        credentials: 'omit',
+        signal: controller.signal,
+      });
+    } finally {
+      inflight.delete(controller);
+    }
+    if (res.status === 401) { onUnauthorized(); throw new AuthError('unauthorized'); }
+    const text = await res.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch { data = null; }
+    if (res.status === 403) {
+      // e.g. "IP banned due to too many failed attempts": the host answers 403
+      // before checking the key, so a later user-initiated retry is harmless.
+      throw new ApiError(403, (data && data.error) || text || '管理接口拒绝访问');
+    }
+    if (isPluginPath(path)) data = unescapeStrings(data);
+    if (!res.ok) throw new ApiError(res.status, (data && data.error) || text || res.statusText);
+    return data;
+  }
+
+  // ---- formatting ----
+  const nf = new Intl.NumberFormat('zh-CN');
+  const fmtInt = (n) => nf.format(n || 0);
+  function fmtTokens(n) {
+    n = n || 0;
+    if (n < 1000) return String(n);
+    if (n < 1e6) return (n / 1e3).toFixed(1) + 'K';
+    return (n / 1e6).toFixed(2) + 'M';
+  }
+  function fmtUSD(v) {
+    if (v == null) return '—';
+    if (v === 0) return '$0.00';
+    if (Math.abs(v) < 0.01) return '$' + v.toFixed(4);
+    return '$' + v.toFixed(2);
+  }
+  const fmtPct = (num, den) => (den ? ((num / den) * 100).toFixed(1) + '%' : '—');
+  const pad = (n) => String(n).padStart(2, '0');
+  function fmtClock(ms) { const d = new Date(ms); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; }
+  function fmtDateTime(ms, withSeconds) {
+    const d = new Date(ms);
+    const base = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    return withSeconds ? base + ':' + pad(d.getSeconds()) : base;
+  }
+  function fmtShortTime(ms) {
+    const d = new Date(ms);
+    const now = new Date();
+    const sameDay = d.toDateString() === now.toDateString();
+    return sameDay ? fmtClock(ms) : `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${fmtClock(ms)}`;
+  }
+  function fmtDuration(ms) {
+    if (!ms) return '—';
+    return ms < 1000 ? ms + 'ms' : (ms / 1000).toFixed(1) + 's';
+  }
+  const toRFC3339 = (date) => date.toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+  // ---- time range ----
+  const state = {
+    range: storageGet(localStorage, LS_RANGE) || 'today',
+    custom: { start: '', end: '' },
+    accounts: null,
+    creds: [],
+    credsOk: true,
+    rows: [],
+    sort: { key: 'cost', dir: -1 },
+    search: '',
+    hideIdle: false,
+    selected: null,
+    drawer: { cursor: null, done: false, loading: false, gen: 0 },
+    loadGen: 0,
+  };
+  if (!['today', 'd7', 'd30', 'custom'].includes(state.range)) state.range = 'today';
+  if (state.range === 'custom') state.range = 'today';
+
+  function rangeParams() {
+    const now = new Date();
+    if (state.range === 'today') {
+      const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      return { start: toRFC3339(start) };
+    }
+    if (state.range === 'd7') return { start: toRFC3339(new Date(now.getTime() - 7 * 864e5)) };
+    if (state.range === 'd30') return { start: toRFC3339(new Date(now.getTime() - 30 * 864e5)) };
+    const params = {};
+    if (state.custom.start) params.start = toRFC3339(new Date(state.custom.start));
+    if (state.custom.end) params.end = toRFC3339(new Date(state.custom.end));
+    return params;
+  }
+  function renderRangeButtons() {
+    for (const b of $('ranges').querySelectorAll('button')) b.setAttribute('aria-pressed', String(b.dataset.range === state.range));
+    $('customRange').classList.toggle('on', state.range === 'custom');
+  }
+
+  // ---- account status from /v8/management/credentials ----
+  function shortStatusMessage(message) {
+    const text = String(message || '');
+    if (/invalid_api_key|unauthori[sz]ed|\b401\b/i.test(text)) return '401 失效';
+    if (/\b403\b|forbidden/i.test(text)) return '403 拒绝';
+    if (/quota|\b429\b|rate.?limit/i.test(text)) return '限额';
+    return '异常';
+  }
+  function credStatus(cred, now) {
+    if (!cred) return { level: 'muted', icon: '⊘', label: '已删除', title: '凭证文件已不存在，只剩历史用量', rank: 4 };
+    if (cred.disabled || cred.status === 'disabled') return { level: 'muted', icon: '⏸', label: '已停用', title: cred.status_message || '', rank: 3 };
+    const cooldowns = (Array.isArray(cred.cooldowns) ? cred.cooldowns : []).filter((c) => Date.parse(c.retry_at) > now);
+    if (cooldowns.length) {
+      const until = Math.max(...cooldowns.map((c) => Date.parse(c.retry_at)));
+      const quota = cooldowns.some((c) => c.http_status === 429 || /quota/i.test(c.reason || ''));
+      const title = cooldowns.map((c) => `${c.scope === 'model' ? c.model_key : '整个账号'}：${c.reason || '冷却'}${c.http_status ? ' (' + c.http_status + ')' : ''}，${fmtDateTime(Date.parse(c.retry_at))} 恢复`).join('\n');
+      return { level: 'warn', icon: '⏳', label: `${quota ? '限额中' : '冷却中'} → ${fmtShortTime(until)}`, title, rank: 1 };
+    }
+    if (cred.status === 'error' || cred.unavailable) {
+      return { level: 'bad', icon: '✕', label: shortStatusMessage(cred.status_message), title: cred.status_message || '', rank: 0 };
+    }
+    const next = Date.parse(cred.next_retry_after || '');
+    if (next > now) return { level: 'warn', icon: '⏳', label: `冷却中 → ${fmtShortTime(next)}`, title: '', rank: 1 };
+    return { level: 'good', icon: '✓', label: '正常', title: '', rank: 2 };
+  }
+  const badge = (s) => h('span', { class: 'badge ' + s.level, title: s.title || s.label }, h('span', { 'aria-hidden': 'true', text: s.icon }), s.label);
+
+  // ---- rows: every credential, joined with usage by auth_index ----
+  function buildRows() {
+    const now = Date.now();
+    const credByIndex = new Map();
+    for (const c of state.creds) if (c && c.auth_index) credByIndex.set(c.auth_index, c);
+    const rows = [];
+    const used = new Set();
+    for (const a of (state.accounts && state.accounts.accounts) || []) {
+      const cred = a.auth_index ? credByIndex.get(a.auth_index) : null;
+      if (cred) used.add(a.auth_index);
+      rows.push(makeRow(a, cred, now, !state.credsOk));
+    }
+    for (const c of state.creds) {
+      if (!c || !c.auth_index || used.has(c.auth_index)) continue;
+      rows.push(makeRow(null, c, now, false));
+    }
+    state.rows = rows;
+  }
+  function makeRow(usage, cred, now, credsUnknown) {
+    // For API-key credentials the record's source is the upstream key itself,
+    // so never show it; auth_id only carries a hash of the key.
+    const isApiKey = !cred && !!usage && /api.?key/i.test(usage.auth_type || '');
+    const label = (cred && (cred.email || cred.label || cred.name)) ||
+      (usage && (isApiKey ? usage.auth_id : usage.source || usage.auth_id)) || '(未知账号)';
+    const file = (cred && cred.name) || (usage && usage.auth_id) || '';
+    let status;
+    if (credsUnknown) status = { level: 'muted', icon: '?', label: '状态未知', title: '凭证接口读取失败', rank: 5 };
+    else if (isApiKey) status = { level: 'muted', icon: '⚿', label: 'API Key', title: '配置文件里的 API Key，凭证接口不提供它的状态', rank: 3 };
+    else status = credStatus(cred, now);
+    const t = (usage && usage.tokens) || {};
+    return {
+      key: (usage ? usage.auth_index + '|' + usage.auth_id : 'cred|' + cred.auth_index),
+      authIndex: (usage && usage.auth_index) || (cred && cred.auth_index) || '',
+      authId: (usage && usage.auth_id) || '',
+      label, file,
+      provider: (usage && usage.provider) || (cred && (cred.provider || cred.type)) || '',
+      usage, cred, status,
+      requests: usage ? usage.requests : 0,
+      success: usage ? usage.success : 0,
+      failed: usage ? usage.failed : 0,
+      input: t.input_tokens || 0,
+      cached: t.cached_tokens || 0,
+      output: t.output_tokens || 0,
+      reasoning: t.reasoning_tokens || 0,
+      total: t.total_tokens || 0,
+      cost: usage ? usage.cost_usd : 0,
+      unpriced: (usage && usage.unpriced_models) || [],
+      last: usage ? Date.parse(usage.last_request_at) || 0 : 0,
+    };
+  }
+
+  // ---- accounts table ----
+  const COLUMNS = [
+    { key: 'label', title: '账号', left: true },
+    { key: 'status', title: '状态', left: true },
+    { key: 'requests', title: '请求' },
+    { key: 'rate', title: '成功率' },
+    { key: 'input', title: '输入(含缓存)' },
+    { key: 'cached', title: '缓存读取' },
+    { key: 'output', title: '输出(含推理)' },
+    { key: 'total', title: '总 token' },
+    { key: 'cost', title: '花费' },
+    { key: 'last', title: '最近调用' },
+  ];
+  function sortValue(row, key) {
+    switch (key) {
+      case 'label': return row.label.toLowerCase();
+      case 'status': return row.status.rank;
+      case 'rate': return row.requests ? row.success / row.requests : -1;
+      default: return row[key] || 0;
+    }
+  }
+  function renderHead() {
+    const tr = $('accountsHead');
+    tr.replaceChildren(...COLUMNS.map((c) => {
+      const sorted = state.sort.key === c.key;
+      return h('th', { class: c.left ? 'left' : null, 'aria-sort': sorted ? (state.sort.dir > 0 ? 'ascending' : 'descending') : 'none' },
+        h('button', { type: 'button', onclick: () => {
+          if (state.sort.key === c.key) state.sort.dir = -state.sort.dir;
+          else state.sort = { key: c.key, dir: c.key === 'label' || c.key === 'status' ? 1 : -1 };
+          renderTable();
+        } }, c.title));
+    }));
+  }
+  function visibleRows() {
+    const q = state.search.trim().toLowerCase();
+    const rows = state.rows.filter((r) => {
+      if (state.hideIdle && !r.requests) return false;
+      if (!q) return true;
+      return r.label.toLowerCase().includes(q) || r.file.toLowerCase().includes(q) || r.authIndex.toLowerCase().includes(q);
+    });
+    const { key, dir } = state.sort;
+    rows.sort((a, b) => {
+      const va = sortValue(a, key);
+      const vb = sortValue(b, key);
+      if (va < vb) return -dir;
+      if (va > vb) return dir;
+      return (b.total - a.total) || a.label.localeCompare(b.label);
+    });
+    return rows;
+  }
+  function costCell(row) {
+    if (!row.usage) return h('td', { class: 'num muted', text: '—' });
+    const partial = row.unpriced.length > 0;
+    const title = partial ? '未设单价的模型不计花费：' + row.unpriced.join(', ') : '';
+    if (partial && !row.cost) return h('td', { class: 'num muted', title, text: '未设单价' });
+    return h('td', { class: 'num', title }, fmtUSD(row.cost), partial ? h('span', { class: 'muted', text: ' *' }) : null);
+  }
+  function renderTable() {
+    renderHead();
+    const body = $('accountsBody');
+    const rows = visibleRows();
+    if (!state.accounts) {
+      body.replaceChildren(h('tr', null, h('td', { colspan: COLUMNS.length, class: 'empty', text: '加载中…' })));
+      $('tableFoot').textContent = '';
+      return;
+    }
+    if (!rows.length) {
+      body.replaceChildren(h('tr', null, h('td', { colspan: COLUMNS.length, class: 'empty', text: state.rows.length ? '没有匹配的账号' : '暂无账号' })));
+    } else {
+      body.replaceChildren(...rows.map((r) => {
+        const tr = h('tr', {
+          class: 'row' + (r.requests ? '' : ' idle'),
+          tabindex: '0',
+          'aria-selected': String(state.selected === r.key),
+          onclick: () => openDrawer(r.key),
+          onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDrawer(r.key); } },
+        },
+        h('td', { title: [r.label, r.file !== r.label ? r.file : '', 'auth_index ' + r.authIndex].filter(Boolean).join('\n') },
+          h('div', { class: 'acct' }, h('span', { text: r.label }), r.file && r.file !== r.label ? h('span', { class: 'file', text: r.file }) : null)),
+        h('td', { class: 'left' }, badge(r.status)),
+        h('td', { class: 'num', title: r.usage ? `成功 ${fmtInt(r.success)} / 失败 ${fmtInt(r.failed)}` : '' }, fmtInt(r.requests)),
+        h('td', { class: 'num' }, fmtPct(r.success, r.requests)),
+        h('td', { class: 'num', title: fmtInt(r.input) }, fmtTokens(r.input)),
+        h('td', { class: 'num', title: fmtInt(r.cached) }, fmtTokens(r.cached)),
+        h('td', { class: 'num', title: `${fmtInt(r.output)}（其中推理 ${fmtInt(r.reasoning)}）` }, fmtTokens(r.output)),
+        h('td', { class: 'num', title: fmtInt(r.total) }, fmtTokens(r.total)),
+        costCell(r),
+        h('td', { class: 'num', title: r.last ? fmtDateTime(r.last, true) : '' }, r.last ? fmtShortTime(r.last) : '—'));
+        return tr;
+      }));
+    }
+    const withUsage = state.rows.filter((r) => r.requests).length;
+    $('tableFoot').textContent = `显示 ${rows.length} / ${state.rows.length} 个账号，其中 ${withUsage} 个在所选时间段有用量。点击一行查看逐条明细。`;
+  }
+
+  function renderTiles() {
+    const t = state.accounts && state.accounts.totals;
+    if (!t) {
+      for (const id of ['tAccounts', 'tRequests', 'tTokens', 'tCost']) $(id).textContent = '—';
+      for (const id of ['tAccountsD', 'tRequestsD', 'tTokensD', 'tCostD']) $(id).replaceChildren();
+      return;
+    }
+    $('tAccounts').textContent = fmtInt(t.accounts);
+    $('tAccountsD').textContent = state.credsOk ? `共 ${fmtInt(state.creds.length)} 个凭证` : '凭证列表读取失败';
+    $('tRequests').textContent = fmtInt(t.requests);
+    $('tRequestsD').textContent = `成功率 ${fmtPct(t.success, t.requests)}，失败 ${fmtInt(t.failed)}`;
+    $('tTokens').textContent = fmtTokens(t.tokens.total_tokens);
+    $('tTokens').title = fmtInt(t.tokens.total_tokens);
+    $('tTokensD').textContent = `输入 ${fmtTokens(t.tokens.input_tokens)}（缓存 ${fmtTokens(t.tokens.cached_tokens)}）· 输出 ${fmtTokens(t.tokens.output_tokens)}`;
+    $('tCost').textContent = fmtUSD(t.cost_usd);
+    const unpriced = new Set();
+    for (const a of state.accounts.accounts) for (const m of a.unpriced_models || []) unpriced.add(m);
+    const d = $('tCostD');
+    if (unpriced.size) {
+      d.replaceChildren(`${unpriced.size} 个模型未设单价，不计入：`, h('button', { class: 'link', type: 'button', onclick: openPrices, text: '去设置' }));
+    } else {
+      d.textContent = t.accounts ? '所有模型都已设单价' : '';
+    }
+  }
+
+  function showBanner(message) { $('bannerText').textContent = message; $('banner').classList.add('on'); }
+  function hideBanner() { $('banner').classList.remove('on'); }
+  function errorText(err) {
+    if (err instanceof ApiError) {
+      if (err.status === 403) return '管理接口拒绝访问（' + err.message + '）。如果是 IP 被临时封禁，请等封禁结束后再点"重试"。';
+      if (err.status === 503) return '用量插件正在更新，请稍后点"重试"。';
+      return `请求失败（HTTP ${err.status}）：${err.message}`;
+    }
+    return '请求失败：' + (err && err.message ? err.message : String(err));
+  }
+
+  // ---- loading ----
+  async function load() {
+    if (auth.blocked) return;
+    const gen = ++state.loadGen;
+    hideBanner();
+    $('refresh').disabled = true;
+    try {
+      // Sequential on purpose: if the key is bad, only one request is rejected.
+      const accounts = await api(API.accounts, { params: rangeParams() });
+      let creds = [];
+      let credsOk = true;
+      try {
+        const res = await api(API.credentials);
+        creds = (res && res.files) || [];
+      } catch (err) {
+        if (err instanceof AuthError) throw err;
+        credsOk = false;
+      }
+      if (gen !== state.loadGen) return;
+      state.accounts = accounts;
+      state.creds = creds;
+      state.credsOk = credsOk;
+      buildRows();
+      renderTiles();
+      renderTable();
+      $('updated').textContent = '更新于 ' + fmtClock(Date.now()) + ':' + pad(new Date().getSeconds());
+      if (state.selected) {
+        const row = state.rows.find((r) => r.key === state.selected);
+        if (row) openDrawer(row.key, true); else closeDrawer();
+      }
+    } catch (err) {
+      if (err instanceof AuthError || gen !== state.loadGen) return;
+      showBanner(errorText(err));
+    } finally {
+      if (gen === state.loadGen) $('refresh').disabled = false;
+    }
+  }
+
+  // ---- drawer ----
+  function closeDrawer() {
+    state.selected = null;
+    state.drawer.gen++;
+    $('drawer').classList.remove('on');
+    for (const tr of $('accountsBody').querySelectorAll('tr.row')) tr.setAttribute('aria-selected', 'false');
+  }
+  function openDrawer(key, keepScroll) {
+    const row = state.rows.find((r) => r.key === key);
+    if (!row) return;
+    state.selected = key;
+    for (const tr of $('accountsBody').querySelectorAll('tr.row')) tr.setAttribute('aria-selected', 'false');
+    renderTable();
+    $('drawer').classList.add('on');
+    $('dTitle').textContent = row.label;
+    $('dMeta').textContent = [row.provider, row.file, row.authIndex && 'auth_index ' + row.authIndex].filter(Boolean).join(' · ');
+    $('dStatus').replaceChildren(badge(row.status));
+    const sum = $('dSum');
+    if (row.usage) {
+      sum.replaceChildren(
+        h('span', null, '请求 ', h('b', { class: 'num', text: fmtInt(row.requests) }), `（成功率 ${fmtPct(row.success, row.requests)}）`),
+        h('span', null, '总 token ', h('b', { class: 'num', title: fmtInt(row.total), text: fmtTokens(row.total) })),
+        h('span', null, '花费 ', h('b', { class: 'num', text: fmtUSD(row.cost) }), row.unpriced.length ? h('span', { class: 'muted', text: `（${row.unpriced.join(', ')} 未设单价）` }) : null),
+        h('span', null, '时间段 ', h('b', { text: `${fmtShortTime(Date.parse(row.usage.first_request_at))} – ${fmtShortTime(row.last)}` })),
+      );
+    } else {
+      sum.replaceChildren(h('span', { text: '所选时间段内没有用量。' }));
+    }
+    if (!keepScroll) $('dBody').scrollTop = 0;
+    state.drawer = { cursor: null, done: false, loading: false, gen: state.drawer.gen + 1 };
+    $('dRows').replaceChildren();
+    if (!row.usage) { $('dSentinel').textContent = ''; state.drawer.done = true; return; }
+    loadMoreRecords();
+  }
+
+  function recordRow(rec) {
+    const ts = Date.parse(rec.timestamp);
+    const t = rec.tokens || {};
+    const failed = !!rec.failed;
+    const result = failed ? `✕ ${rec.failure_status_code || '失败'}` : '✓ 成功';
+    const tr = h('tr', { class: failed ? 'fail' : null, title: failed ? '点击查看失败原因' : null },
+      h('td', { class: 'left num', title: fmtDateTime(ts, true) }, fmtShortTime(ts) + ':' + pad(new Date(ts).getSeconds())),
+      h('td', { class: 'left', text: rec.model || '' }),
+      h('td', { class: 'left res', text: result }),
+      h('td', { class: 'num', text: fmtDuration(rec.latency_ms) }),
+      h('td', { class: 'num', text: fmtDuration(rec.ttft_ms) }),
+      h('td', { class: 'num', title: `输入 ${fmtInt(t.input_tokens)} / 缓存读取 ${fmtInt(t.cached_tokens)} / 输出 ${fmtInt(t.output_tokens)}（推理 ${fmtInt(t.reasoning_tokens)}）` },
+        `${fmtTokens(t.input_tokens)} / ${fmtTokens(t.cached_tokens)} / ${fmtTokens(t.output_tokens)}`),
+      h('td', { class: 'num', title: rec.cost_usd == null ? '该模型未设单价' : '' }, fmtUSD(rec.cost_usd)));
+    if (failed) {
+      let detail = null;
+      tr.addEventListener('click', () => {
+        if (detail) { detail.remove(); detail = null; return; }
+        const full = rec.failure_body || '(无失败内容)';
+        const shown = full.length > FAILURE_PREVIEW ? full.slice(0, FAILURE_PREVIEW) + '\n…（已截断，共 ' + fmtInt(full.length) + ' 字符）' : full;
+        detail = h('tr', { class: 'detail' }, h('td', { colspan: 7 },
+          h('pre', { class: 'body', text: shown }),
+          h('button', { class: 'btn', type: 'button', style: 'margin-top:6px', onclick: (e) => {
+            e.stopPropagation();
+            navigator.clipboard.writeText(full).then(() => { e.target.textContent = '已复制'; }, () => { e.target.textContent = '复制失败'; });
+          } }, '复制全文')));
+        tr.after(detail);
+      });
+    }
+    return tr;
+  }
+
+  async function loadMoreRecords() {
+    const d = state.drawer;
+    if (d.loading || d.done || !state.selected || auth.blocked) return;
+    const row = state.rows.find((r) => r.key === state.selected);
+    if (!row) return;
+    const gen = d.gen;
+    d.loading = true;
+    $('dSentinel').textContent = '加载中…';
+    try {
+      const params = Object.assign({ limit: RECORDS_PAGE }, rangeParams());
+      if (row.authIndex) params.auth_index = row.authIndex; else params.auth_id = row.authId;
+      if (d.cursor) params.cursor = d.cursor;
+      const page = await api(API.records, { params });
+      if (gen !== state.drawer.gen) return;
+      $('dRows').append(...page.records.map(recordRow));
+      d.cursor = page.next_cursor;
+      d.done = !page.next_cursor;
+      $('dSentinel').textContent = d.done ? ($('dRows').children.length ? '已到底' : '没有记录') : '';
+      if (!d.done) $('dSentinel').append(h('button', { class: 'btn', type: 'button', onclick: loadMoreRecords }, '加载更多'));
+    } catch (err) {
+      if (gen !== state.drawer.gen) return;
+      $('dSentinel').replaceChildren(err instanceof AuthError ? '' : errorText(err), err instanceof AuthError ? '' : h('button', { class: 'btn', type: 'button', onclick: loadMoreRecords }, '重试'));
+    } finally {
+      if (gen === state.drawer.gen) d.loading = false;
+    }
+  }
+  if ('IntersectionObserver' in window) {
+    new IntersectionObserver((entries) => {
+      if (entries.some((e) => e.isIntersecting) && !state.drawer.done) loadMoreRecords();
+    }, { root: $('dBody'), rootMargin: '200px' }).observe($('dSentinel'));
+  }
+
+  // ---- prices dialog ----
+  const PRICE_FIELDS = [['input', '输入'], ['output', '输出'], ['cache_read', '缓存读取'], ['cache_creation', '缓存创建']];
+  function priceRow(model, price, known) {
+    const unset = !price;
+    const tr = h('tr', { class: unset ? 'unset' : null },
+      h('td', { class: 'left' }, h('input', { class: 'field model', value: model, readOnly: known, 'aria-label': '模型名', placeholder: '模型名' })),
+      ...PRICE_FIELDS.map(([field, title]) => h('td', null, h('input', {
+        class: 'field num', type: 'number', min: '0', max: '10000', step: 'any', 'data-field': field, 'aria-label': title,
+        value: price && price[field] != null ? String(price[field]) : '', placeholder: unset ? '未设置' : '0',
+      }))),
+      h('td', null, h('button', { class: 'x', type: 'button', 'aria-label': '删除此模型的单价', title: '删除单价', onclick: () => tr.remove() }, '×')));
+    tr.addEventListener('input', () => tr.classList.remove('unset'));
+    return tr;
+  }
+  async function openPrices() {
+    const dlg = $('prices');
+    $('priceNote').textContent = '加载中…';
+    $('priceNote').classList.remove('err');
+    $('priceRows').replaceChildren();
+    if (!dlg.open) dlg.showModal();
+    try {
+      const res = await api(API.prices);
+      const byModel = new Map(res.prices.map((p) => [p.model, p]));
+      const models = [...new Set([...res.prices.map((p) => p.model), ...res.models_seen])].sort();
+      $('priceRows').replaceChildren(...models.map((m) => priceRow(m, byModel.get(m), true)));
+      const missing = res.models_seen.filter((m) => !byModel.has(m)).length;
+      $('priceNote').textContent = missing ? `${missing} 个出现过的模型还没有单价（黄色行）` : '';
+    } catch (err) {
+      if (err instanceof AuthError) { dlg.close(); return; }
+      $('priceNote').textContent = errorText(err);
+      $('priceNote').classList.add('err');
+    }
+  }
+  function collectPrices() {
+    const out = [];
+    const seen = new Set();
+    for (const tr of $('priceRows').querySelectorAll('tr')) {
+      const model = tr.querySelector('input.model').value.trim();
+      const inputs = [...tr.querySelectorAll('input[data-field]')];
+      if (inputs.every((i) => i.value.trim() === '')) continue; // blank row = unpriced
+      if (!model) throw new Error('有一行没填模型名');
+      if ([...model].length > 200) throw new Error(`模型名太长：${model.slice(0, 40)}…`);
+      if (seen.has(model)) throw new Error('模型重复：' + model);
+      seen.add(model);
+      const price = { model };
+      for (const i of inputs) {
+        const raw = i.value.trim();
+        const v = raw === '' ? 0 : Number(raw);
+        if (!Number.isFinite(v) || v < 0 || v > 10000) throw new Error(`${model} 的单价必须是 0–10000 之间的数字`);
+        price[i.dataset.field] = v;
+      }
+      out.push(price);
+    }
+    return out;
+  }
+  async function savePrices() {
+    let prices;
+    try { prices = collectPrices(); } catch (err) {
+      $('priceNote').textContent = err.message;
+      $('priceNote').classList.add('err');
+      return;
+    }
+    $('priceSave').disabled = true;
+    $('priceNote').classList.remove('err');
+    $('priceNote').textContent = '保存中…';
+    try {
+      await api(API.prices, { method: 'PUT', body: { prices } });
+      $('prices').close();
+      load();
+    } catch (err) {
+      if (err instanceof AuthError) { $('prices').close(); return; }
+      $('priceNote').textContent = errorText(err);
+      $('priceNote').classList.add('err');
+    } finally {
+      $('priceSave').disabled = false;
+    }
+  }
+  function importPanelPrices() {
+    let data = null;
+    try { data = JSON.parse(storageGet(localStorage, PANEL_PRICES_KEY) || 'null'); } catch { data = null; }
+    const entries = [];
+    if (data && typeof data === 'object') {
+      const list = Array.isArray(data) ? data.map((p) => [p && (p.model || p.name), p]) : Object.entries(data);
+      for (const [model, p] of list) {
+        if (!model || !p || typeof p !== 'object') continue;
+        entries.push([String(model).trim(), {
+          input: Number(p.input) || 0, output: Number(p.output) || 0,
+          cache_read: Number(p.cacheRead ?? p.cache_read) || 0, cache_creation: Number(p.cacheCreate ?? p.cache_creation) || 0,
+        }]);
+      }
+    }
+    if (!entries.length) {
+      $('priceNote').textContent = '面板里没有找到保存的单价（只能读取当前浏览器里的面板设置）';
+      $('priceNote').classList.add('err');
+      return;
+    }
+    const rows = new Map([...$('priceRows').querySelectorAll('tr')].map((tr) => [tr.querySelector('input.model').value.trim(), tr]));
+    for (const [model, price] of entries) {
+      const fresh = priceRow(model, price, rows.has(model));
+      if (rows.has(model)) rows.get(model).replaceWith(fresh); else $('priceRows').append(fresh);
+    }
+    $('priceNote').classList.remove('err');
+    $('priceNote').textContent = `已从面板导入 ${entries.length} 个模型的单价（忽略阶梯价），点"保存"后生效`;
+  }
+
+  // ---- wiring ----
+  $('ranges').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-range]');
+    if (!b) return;
+    state.range = b.dataset.range;
+    renderRangeButtons();
+    if (state.range === 'custom') { $('customStart').focus(); return; }
+    storageSet(localStorage, LS_RANGE, state.range);
+    load();
+  });
+  $('applyCustom').addEventListener('click', () => {
+    state.custom = { start: $('customStart').value, end: $('customEnd').value };
+    if (state.custom.start && state.custom.end && new Date(state.custom.start) >= new Date(state.custom.end)) {
+      showBanner('结束时间必须晚于开始时间');
+      return;
+    }
+    load();
+  });
+  $('search').addEventListener('input', (e) => { state.search = e.target.value; renderTable(); });
+  $('hideIdle').addEventListener('change', (e) => { state.hideIdle = e.target.checked; renderTable(); });
+  $('refresh').addEventListener('click', load);
+  $('bannerRetry').addEventListener('click', () => {
+    if (auth.blocked) { showGate(''); return; }
+    load();
+  });
+  $('dClose').addEventListener('click', closeDrawer);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && $('drawer').classList.contains('on') && !$('prices').open) closeDrawer(); });
+  $('openPrices').addEventListener('click', openPrices);
+  $('pricesClose').addEventListener('click', () => $('prices').close());
+  $('priceCancel').addEventListener('click', () => $('prices').close());
+  $('priceSave').addEventListener('click', savePrices);
+  $('priceImport').addEventListener('click', importPanelPrices);
+  $('priceAdd').addEventListener('click', () => {
+    const tr = priceRow('', null, false);
+    $('priceRows').prepend(tr);
+    tr.querySelector('input.model').focus();
+  });
+  $('gateForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const key = $('gateKey').value.trim();
+    if (!key) return;
+    storageSet(sessionStorage, SS_MANUAL_KEY, key);
+    // A typed key wins over a panel key that was already rejected.
+    storageSet(sessionStorage, SS_PANEL_REJECTED, '1');
+    $('gateKey').value = '';
+    auth.blocked = false;
+    hideGate();
+    load();
+  });
+  $('gatePanel').addEventListener('click', () => {
+    storageDel(sessionStorage, SS_PANEL_REJECTED);
+    if (!readPanelKey()) { showGate('面板里没有保存密钥（登录时没有勾选"记住密码"）。'); return; }
+    auth.blocked = false;
+    hideGate();
+    load();
+  });
+
+  renderRangeButtons();
+  renderTiles();
+  renderTable();
+  if (currentKey()) load(); else { auth.blocked = true; showGate(''); }
+})();
+</script>
 </body>
 </html>
