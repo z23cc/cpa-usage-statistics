@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -32,6 +34,12 @@ var errInvalidCursor = errors.New("invalid cursor")
 // SQLiteStore persists usage records in a pure-Go SQLite database.
 type SQLiteStore struct {
 	db *sql.DB
+
+	// prices caches model_prices so cost math never touches the single connection.
+	pricesMu sync.RWMutex
+	prices   map[string]ModelPrice
+	// replaceMu orders whole-table price saves with their cache updates.
+	replaceMu sync.Mutex
 }
 
 // NewSQLiteStore opens (creating if needed) the usage database at path.
@@ -51,6 +59,10 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 	if err := store.initSchema(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	// Prices only affect cost display; never let them stop usage recording.
+	if err := store.loadPrices(context.Background()); err != nil {
+		store.setPrices(map[string]ModelPrice{})
 	}
 	return store, nil
 }
@@ -119,7 +131,7 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_usage_records_auth_ts ON usage_records(auth_index, timestamp, id)`); err != nil {
 		return fmt.Errorf("usage sqlite init schema: %w", err)
 	}
-	return nil
+	return s.initPriceSchema(ctx)
 }
 
 // migrateSchema 让老版本 db 的字段自愈到最新：用 table_info 读出现有列，
@@ -286,7 +298,8 @@ func (s *SQLiteStore) Query(ctx context.Context, rng QueryRange) (APIUsage, erro
 }
 
 // AccountSummary aggregates usage per credential (auth_index + auth_id) within
-// rng, ordered by total tokens descending.
+// rng, ordered by total tokens descending. SQL groups per model as well so each
+// model's price applies to its own tokens; the groups are merged per account here.
 // ponytail: scans every row in rng (~1 s per 500k rows) while holding the only
 // connection, so concurrent inserts wait; pass start/end or set retention_days,
 // add a daily rollup table if unbounded queries over millions of rows are needed.
@@ -297,16 +310,17 @@ func (s *SQLiteStore) AccountSummary(ctx context.Context, rng QueryRange) (Accou
 	}
 	where, args := rangeWhere(rng)
 	query := `
-SELECT auth_index, auth_id, MAX(source), MAX(provider), MAX(auth_type),
+SELECT auth_index, auth_id, model, MAX(source), MAX(provider), MAX(auth_type),
        COUNT(*), SUM(failed),
        SUM(input_tokens), SUM(output_tokens), SUM(reasoning_tokens), SUM(cached_tokens),
        SUM(cache_read_tokens), SUM(cache_creation_tokens), SUM(total_tokens),
+       SUM(` + pureInputSQL + `),
        MIN(timestamp), MAX(timestamp)
 FROM usage_records`
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
-	query += " GROUP BY auth_index, auth_id ORDER BY SUM(total_tokens) DESC, auth_id ASC, auth_index ASC"
+	query += " GROUP BY auth_index, auth_id, model"
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -314,44 +328,109 @@ FROM usage_records`
 	}
 	defer func() { _ = rows.Close() }()
 
+	type accountKey struct{ authIndex, authID string }
+	accounts := make(map[accountKey]*AccountUsage)
 	for rows.Next() {
-		var account AccountUsage
-		var firstText, lastText string
+		var group AccountUsage
+		var model, firstText, lastText string
+		var pureInput int64
 		if err := rows.Scan(
-			&account.AuthIndex,
-			&account.AuthID,
-			&account.Source,
-			&account.Provider,
-			&account.AuthType,
-			&account.Requests,
-			&account.Failed,
-			&account.Tokens.InputTokens,
-			&account.Tokens.OutputTokens,
-			&account.Tokens.ReasoningTokens,
-			&account.Tokens.CachedTokens,
-			&account.Tokens.CacheReadTokens,
-			&account.Tokens.CacheCreationTokens,
-			&account.Tokens.TotalTokens,
+			&group.AuthIndex,
+			&group.AuthID,
+			&model,
+			&group.Source,
+			&group.Provider,
+			&group.AuthType,
+			&group.Requests,
+			&group.Failed,
+			&group.Tokens.InputTokens,
+			&group.Tokens.OutputTokens,
+			&group.Tokens.ReasoningTokens,
+			&group.Tokens.CachedTokens,
+			&group.Tokens.CacheReadTokens,
+			&group.Tokens.CacheCreationTokens,
+			&group.Tokens.TotalTokens,
+			&pureInput,
 			&firstText,
 			&lastText,
 		); err != nil {
 			return result, fmt.Errorf("usage sqlite account summary scan: %w", err)
 		}
-		account.Success = account.Requests - account.Failed
-		if account.FirstRequestAt, err = parseStoredTimestamp(firstText); err != nil {
+		if group.FirstRequestAt, err = parseStoredTimestamp(firstText); err != nil {
 			return result, err
 		}
-		if account.LastRequestAt, err = parseStoredTimestamp(lastText); err != nil {
+		if group.LastRequestAt, err = parseStoredTimestamp(lastText); err != nil {
 			return result, err
 		}
-		result.Accounts = append(result.Accounts, account)
-		addTotals(&result.Totals, account)
+		key := accountKey{group.AuthIndex, group.AuthID}
+		account, ok := accounts[key]
+		if !ok {
+			group.UnpricedModels = []string{}
+			account = &group
+			accounts[key] = account
+		} else {
+			mergeAccountGroup(account, group)
+		}
+		if price, ok := s.priceFor(model); ok {
+			account.CostUSD += costUSD(price, pureInput, group.Tokens.CachedTokens, group.Tokens.CacheCreationTokens, group.Tokens.OutputTokens)
+		} else {
+			account.UnpricedModels = append(account.UnpricedModels, model)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return result, fmt.Errorf("usage sqlite account summary rows: %w", err)
 	}
+
+	for _, account := range accounts {
+		account.Success = account.Requests - account.Failed
+		account.CostUSD = roundUSD(account.CostUSD)
+		sort.Strings(account.UnpricedModels)
+		result.Accounts = append(result.Accounts, *account)
+	}
+	sort.Slice(result.Accounts, func(i, j int) bool {
+		a, b := result.Accounts[i], result.Accounts[j]
+		if a.Tokens.TotalTokens != b.Tokens.TotalTokens {
+			return a.Tokens.TotalTokens > b.Tokens.TotalTokens
+		}
+		if a.AuthID != b.AuthID {
+			return a.AuthID < b.AuthID
+		}
+		return a.AuthIndex < b.AuthIndex
+	})
+	for _, account := range result.Accounts {
+		addTotals(&result.Totals, account)
+	}
+	result.Totals.CostUSD = roundUSD(result.Totals.CostUSD)
 	result.Totals.Accounts = len(result.Accounts)
 	return result, nil
+}
+
+// mergeAccountGroup folds one per-model group into its account, keeping the
+// same MAX/MIN semantics the per-account SQL used before.
+func mergeAccountGroup(account *AccountUsage, group AccountUsage) {
+	account.Source = max(account.Source, group.Source)
+	account.Provider = max(account.Provider, group.Provider)
+	account.AuthType = max(account.AuthType, group.AuthType)
+	account.Requests += group.Requests
+	account.Failed += group.Failed
+	addTokens(&account.Tokens, group.Tokens)
+	if group.FirstRequestAt.Before(account.FirstRequestAt) {
+		account.FirstRequestAt = group.FirstRequestAt
+	}
+	if group.LastRequestAt.After(account.LastRequestAt) {
+		account.LastRequestAt = group.LastRequestAt
+	}
+}
+
+// recordCost prices one record, or returns nil when its model has no price.
+func (s *SQLiteStore) recordCost(detail RequestDetail) *float64 {
+	price, ok := s.priceFor(detail.Model)
+	if !ok {
+		return nil
+	}
+	cost := roundUSD(costUSD(price, pureInputTokens(detail.Provider, detail.Tokens),
+		detail.Tokens.CachedTokens, detail.Tokens.CacheCreationTokens, detail.Tokens.OutputTokens))
+	return &cost
 }
 
 // ListRecords returns one page of records newest first, optionally filtered by
@@ -359,7 +438,7 @@ FROM usage_records`
 // long request is written after rows that started later, so it is not a safe
 // watermark for incremental sync.
 func (s *SQLiteStore) ListRecords(ctx context.Context, q RecordsQuery) (RecordsPage, error) {
-	page := RecordsPage{Records: []RequestDetail{}}
+	page := RecordsPage{Records: []RecordDetail{}}
 	if s == nil || s.db == nil {
 		return page, nil
 	}
@@ -410,7 +489,7 @@ func (s *SQLiteStore) ListRecords(ctx context.Context, q RecordsQuery) (RecordsP
 			page.NextCursor = &next
 			break
 		}
-		page.Records = append(page.Records, detail)
+		page.Records = append(page.Records, RecordDetail{RequestDetail: detail, CostUSD: s.recordCost(detail)})
 		lastTimestampText = timestampText
 	}
 	if err := rows.Err(); err != nil {
@@ -493,13 +572,18 @@ func addTotals(totals *UsageTotals, account AccountUsage) {
 	totals.Requests += account.Requests
 	totals.Success += account.Success
 	totals.Failed += account.Failed
-	totals.Tokens.InputTokens += account.Tokens.InputTokens
-	totals.Tokens.OutputTokens += account.Tokens.OutputTokens
-	totals.Tokens.ReasoningTokens += account.Tokens.ReasoningTokens
-	totals.Tokens.CachedTokens += account.Tokens.CachedTokens
-	totals.Tokens.CacheReadTokens += account.Tokens.CacheReadTokens
-	totals.Tokens.CacheCreationTokens += account.Tokens.CacheCreationTokens
-	totals.Tokens.TotalTokens += account.Tokens.TotalTokens
+	addTokens(&totals.Tokens, account.Tokens)
+	totals.CostUSD += account.CostUSD
+}
+
+func addTokens(dst *TokenStats, src TokenStats) {
+	dst.InputTokens += src.InputTokens
+	dst.OutputTokens += src.OutputTokens
+	dst.ReasoningTokens += src.ReasoningTokens
+	dst.CachedTokens += src.CachedTokens
+	dst.CacheReadTokens += src.CacheReadTokens
+	dst.CacheCreationTokens += src.CacheCreationTokens
+	dst.TotalTokens += src.TotalTokens
 }
 
 // encodeRecordsCursor packs the last row's stored timestamp text and id.
@@ -575,7 +659,18 @@ func (s *SQLiteStore) Close() error {
 	if s == nil || s.db == nil {
 		return nil
 	}
-	return s.db.Close()
+	// db.Close closes only idle connections: a running statement, tx or open
+	// rows would keep writing usage.db after it returns. With MaxOpenConns(1),
+	// taking the connection first waits for that work to finish.
+	ctx, cancel := context.WithTimeout(context.Background(), insertTimeout)
+	defer cancel()
+	conn, errConn := s.db.Conn(ctx)
+	errClose := s.db.Close()
+	if errConn == nil {
+		// The db is closed, so releasing the conn closes the driver connection.
+		_ = conn.Close()
+	}
+	return errClose
 }
 
 func formatTimestamp(timestamp time.Time) string {

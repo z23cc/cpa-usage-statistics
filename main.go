@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	_ "embed"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -14,6 +16,12 @@ import (
 	"github.com/google/uuid"
 )
 
+// accountsPageHTML is the self-contained per-account usage page served as a
+// plugin resource and shown by the management panel in an iframe.
+//
+//go:embed ui/index.html
+var accountsPageHTML []byte
+
 const (
 	abiVersion uint32 = 1
 	pluginID          = "usage-statistics"
@@ -23,6 +31,13 @@ const (
 	managementUsagePath    = "/plugins/" + pluginID + "/usage"
 	managementAccountsPath = "/plugins/" + pluginID + "/accounts"
 	managementRecordsPath  = "/plugins/" + pluginID + "/records"
+	managementPricesPath   = "/plugins/" + pluginID + "/prices"
+	// Resource routes are served by the host under resourceBasePath without
+	// management authentication, so only the static page may live there.
+	resourceBasePath = "/v0/resource/plugins/" + pluginID + "/"
+	accountsPagePath = "/ui"
+	accountsPageMenu = "账号用量"
+	accountsPageCSP  = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'self'"
 	// insertTimeout is long because the host drops a record whose usage.handle
 	// fails and never retries; its queue is unbounded, so waiting behind a read
 	// on the single connection only delays the record.
@@ -35,7 +50,7 @@ const (
 
 // Overridable at build time via -ldflags "-X main.pluginVersion=...".
 var (
-	pluginVersion    = "0.2.0-acct.1"
+	pluginVersion    = "0.3.0-acct.1"
 	pluginAuthor     = "Fwindy"
 	pluginRepository = "https://github.com/Fwindy/cpa-usage-statistics"
 )
@@ -77,6 +92,9 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			return nil, err
 		}
 		return okEnvelope(registerResponse())
+	case "plugin.quiesce":
+		quiescePlugin()
+		return okEnvelope(map[string]any{"quiesced": true})
 	case "usage.handle":
 		return handleUsage(request)
 	case "management.register":
@@ -134,7 +152,8 @@ func registerResponse() registerResponsePayload {
 }
 
 type managementRegistrationPayload struct {
-	Routes []managementRoute `json:"routes"`
+	Routes    []managementRoute `json:"routes"`
+	Resources []resourceRoute   `json:"resources,omitempty"`
 }
 
 type managementRoute struct {
@@ -143,13 +162,26 @@ type managementRoute struct {
 	Description string `json:"Description"`
 }
 
+// resourceRoute is a browser-navigable page under resourceBasePath; Menu makes
+// the management panel list it in the sidebar.
+type resourceRoute struct {
+	Path        string `json:"Path"`
+	Menu        string `json:"Menu"`
+	Description string `json:"Description"`
+}
+
 func managementRegistration() managementRegistrationPayload {
 	return managementRegistrationPayload{
 		Routes: []managementRoute{
 			{Method: "GET", Path: managementUsagePath, Description: "Query persisted usage grouped by api key and model."},
 			{Method: "DELETE", Path: managementUsagePath, Description: "Delete persisted usage records by id."},
-			{Method: "GET", Path: managementAccountsPath, Description: "Aggregate persisted usage per credential."},
+			{Method: "GET", Path: managementAccountsPath, Description: "Aggregate persisted usage and cost per credential."},
 			{Method: "GET", Path: managementRecordsPath, Description: "Page persisted usage records newest first, optionally for one credential."},
+			{Method: "GET", Path: managementPricesPath, Description: "List model prices (USD per 1M tokens) and the models seen."},
+			{Method: "PUT", Path: managementPricesPath, Description: "Replace all model prices."},
+		},
+		Resources: []resourceRoute{
+			{Path: accountsPagePath, Menu: accountsPageMenu, Description: "Per-account usage, cost and request details."},
 		},
 	}
 }
@@ -283,8 +315,24 @@ func handleManagement(request []byte) ([]byte, error) {
 		}
 	}
 	method := strings.ToUpper(strings.TrimSpace(req.Method))
-	// The host passes the full request path (/v0/management/plugins/...).
+	// The host passes the full request path. Resource requests skip management
+	// auth, so they are answered first and can never reach a data handler.
+	if strings.HasPrefix(req.Path, resourceBasePath) {
+		return resourceGet(method, req.Path)
+	}
+	if quiesced.Load() {
+		return okEnvelope(jsonManagementResponse(503, map[string]string{"error": "usage store is being replaced"}))
+	}
 	switch {
+	case strings.HasSuffix(req.Path, managementPricesPath):
+		switch method {
+		case "GET":
+			return pricesGet()
+		case "PUT":
+			return pricesPut(req)
+		default:
+			return okEnvelope(jsonManagementResponse(405, map[string]string{"error": "method not allowed"}))
+		}
 	case strings.HasSuffix(req.Path, managementAccountsPath):
 		if method != "GET" {
 			return okEnvelope(jsonManagementResponse(405, map[string]string{"error": "method not allowed"}))
@@ -346,7 +394,7 @@ func recordsGet(req managementRequest) ([]byte, error) {
 	}
 	store := currentStore()
 	if store == nil {
-		return okEnvelope(jsonManagementResponse(200, RecordsPage{Records: []RequestDetail{}}))
+		return okEnvelope(jsonManagementResponse(200, RecordsPage{Records: []RecordDetail{}}))
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
 	defer cancel()
@@ -358,6 +406,80 @@ func recordsGet(req managementRequest) ([]byte, error) {
 		return okEnvelope(jsonManagementResponse(500, map[string]string{"error": "failed to query usage records"}))
 	}
 	return okEnvelope(jsonManagementResponse(200, page))
+}
+
+// resourceGet serves the static accounts page and nothing else.
+func resourceGet(method, path string) ([]byte, error) {
+	if method != "GET" || path != resourceBasePath+strings.TrimPrefix(accountsPagePath, "/") {
+		return okEnvelope(managementResponse{
+			StatusCode: 404,
+			Headers:    map[string][]string{"Content-Type": {"text/plain; charset=utf-8"}},
+			Body:       []byte("not found"),
+		})
+	}
+	return okEnvelope(managementResponse{
+		StatusCode: 200,
+		Headers: map[string][]string{
+			"Content-Type":            {"text/html; charset=utf-8"},
+			"Content-Security-Policy": {accountsPageCSP},
+			"X-Content-Type-Options":  {"nosniff"},
+			"Referrer-Policy":         {"no-referrer"},
+			// A new plugin build ships a new page; never serve a stale copy.
+			"Cache-Control": {"no-store"},
+		},
+		Body: accountsPageHTML,
+	})
+}
+
+func pricesGet() ([]byte, error) {
+	store := currentStore()
+	if store == nil {
+		return okEnvelope(jsonManagementResponse(200, PricesResponse{Prices: []ModelPrice{}, ModelsSeen: []string{}}))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+	result, err := store.Prices(ctx)
+	if err != nil {
+		return okEnvelope(jsonManagementResponse(500, map[string]string{"error": "failed to query prices"}))
+	}
+	return okEnvelope(jsonManagementResponse(200, result))
+}
+
+// pricesPut replaces the whole price table. An explicit empty list clears it;
+// a body without "prices" is rejected so a malformed request cannot wipe it.
+func pricesPut(req managementRequest) ([]byte, error) {
+	var body struct {
+		Prices *[]ModelPrice `json:"prices"`
+	}
+	// Reject unknown keys, e.g. the panel's cacheRead spelling, instead of
+	// silently saving a zero price.
+	decoder := json.NewDecoder(bytes.NewReader(req.Body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&body); err != nil {
+		return okEnvelope(jsonManagementResponse(400, map[string]string{"error": "invalid body"}))
+	}
+	if body.Prices == nil {
+		return okEnvelope(jsonManagementResponse(400, map[string]string{"error": "prices required"}))
+	}
+	prices, err := validatePrices(*body.Prices)
+	if err != nil {
+		return okEnvelope(jsonManagementResponse(400, map[string]string{"error": "invalid prices: " + err.Error()}))
+	}
+	store := currentStore()
+	if store == nil {
+		return okEnvelope(jsonManagementResponse(503, map[string]string{"error": "usage store unavailable"}))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+	if err := store.ReplacePrices(ctx, prices); err != nil {
+		return okEnvelope(jsonManagementResponse(500, map[string]string{"error": "failed to save prices"}))
+	}
+	// The save is committed; a failing models_seen lookup must not turn it into an error.
+	result, err := store.Prices(ctx)
+	if err != nil {
+		result = PricesResponse{Prices: store.cachedPrices(), ModelsSeen: []string{}}
+	}
+	return okEnvelope(jsonManagementResponse(200, result))
 }
 
 func usageGet(req managementRequest) ([]byte, error) {
@@ -468,7 +590,27 @@ var (
 
 	cleanupMu   sync.Mutex
 	lastCleanup time.Time
+
+	// quiesced is set by plugin.quiesce, which the host sends to the old
+	// instance right before a hot reload loads the new one. Closing the db then
+	// keeps two SQLite copies in one process from writing usage.db together.
+	quiesced atomic.Bool
 )
+
+// lifecycleMu serialises quiesce with register/reconfigure, so a host rollback
+// that re-registers this instance cannot interleave with a slow quiesce and
+// leave the plugin active without a store.
+var lifecycleMu sync.Mutex
+
+// quiescePlugin closes the store and returns only after in-flight database
+// work has finished (see SQLiteStore.Close). Usage records arriving afterwards
+// are ignored until the next register.
+func quiescePlugin() {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+	quiesced.Store(true)
+	closeStore()
+}
 
 func currentStore() *SQLiteStore {
 	storeMu.RLock()
@@ -476,13 +618,16 @@ func currentStore() *SQLiteStore {
 	return globalStore
 }
 
+// closeStore detaches the store first so new callers see nil at once, then
+// waits for in-flight work in Close without holding storeMu.
 func closeStore() {
 	storeMu.Lock()
-	defer storeMu.Unlock()
-	if globalStore != nil {
-		_ = globalStore.Close()
-		globalStore = nil
-		currentDBPath = ""
+	store := globalStore
+	globalStore = nil
+	currentDBPath = ""
+	storeMu.Unlock()
+	if store != nil {
+		_ = store.Close()
 	}
 }
 
@@ -539,6 +684,8 @@ type lifecycleRequest struct {
 }
 
 func configurePlugin(request []byte) error {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
 	var req lifecycleRequest
 	if len(request) > 0 {
 		if err := json.Unmarshal(request, &req); err != nil {
@@ -554,6 +701,9 @@ func configurePlugin(request []byte) error {
 	if err := ensureStore(cfg); err != nil {
 		return err
 	}
+	// A register after quiesce (e.g. the host rolling back a failed reload)
+	// has just reopened the store, so resume normal service.
+	quiesced.Store(false)
 	if cfg.RetentionDays > 0 {
 		cleanupMu.Lock()
 		lastCleanup = time.Time{}

@@ -90,6 +90,9 @@ type AccountUsage struct {
 	Tokens         TokenStats `json:"tokens"`
 	FirstRequestAt time.Time  `json:"first_request_at"`
 	LastRequestAt  time.Time  `json:"last_request_at"`
+	// CostUSD covers only priced models; UnpricedModels lists the rest.
+	CostUSD        float64  `json:"cost_usd"`
+	UnpricedModels []string `json:"unpriced_models"`
 }
 
 // UsageTotals sums every account in an accounts response.
@@ -99,6 +102,7 @@ type UsageTotals struct {
 	Success  int64      `json:"success"`
 	Failed   int64      `json:"failed"`
 	Tokens   TokenStats `json:"tokens"`
+	CostUSD  float64    `json:"cost_usd"`
 }
 
 // AccountsResponse is the body of GET /plugins/usage-statistics/accounts.
@@ -117,9 +121,34 @@ type RecordsQuery struct {
 	Cursor string
 }
 
+// RecordDetail is one /records row: the stored record plus its cost. CostUSD
+// is null when the record's model has no price. /usage keeps RequestDetail so
+// its output stays unchanged.
+type RecordDetail struct {
+	RequestDetail
+	CostUSD *float64 `json:"cost_usd"`
+}
+
 // RecordsPage is the body of GET /plugins/usage-statistics/records.
 // NextCursor is null on the last page.
 type RecordsPage struct {
-	Records    []RequestDetail `json:"records"`
-	NextCursor *string         `json:"next_cursor"`
+	Records    []RecordDetail `json:"records"`
+	NextCursor *string        `json:"next_cursor"`
+}
+
+// ModelPrice is one model's price in USD per 1M tokens, the panel's unit.
+type ModelPrice struct {
+	Model         string    `json:"model"`
+	Input         float64   `json:"input"`
+	Output        float64   `json:"output"`
+	CacheRead     float64   `json:"cache_read"`
+	CacheCreation float64   `json:"cache_creation"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+// PricesResponse is the body of GET and PUT /plugins/usage-statistics/prices.
+type PricesResponse struct {
+	Prices []ModelPrice `json:"prices"`
+	// ModelsSeen lists every model present in usage_records, priced or not.
+	ModelsSeen []string `json:"models_seen"`
 }

@@ -2,7 +2,7 @@
 
 CLIProxyAPI 的持久化用量统计插件。记录每次请求的用量，写入本地 SQLite；提供查询/删除接口。字段命名对齐上游 `usage.Record` / `usage.Detail`。
 
-当前版本：`0.2.0-acct.1`（在 `0.1.0` 基础上增加按账号汇总和按账号分页明细接口）
+当前版本：`0.3.0-acct.1`（在 `0.1.0` 基础上增加按账号汇总、按账号分页明细、单价与花费，以及面板侧边栏里的"账号用量"页面）
 
 ## 建议使用配套的前端面板
 
@@ -118,12 +118,16 @@ GET /v0/management/plugins/usage-statistics/accounts?start=<RFC3339>&end=<RFC333
         "total_tokens": 53763
       },
       "first_request_at": "2026-10-22T06:40:53.1Z",
-      "last_request_at": "2026-10-22T06:48:37.2Z"
+      "last_request_at": "2026-10-22T06:48:37.2Z",
+      "cost_usd": 1.12999,
+      "unpriced_models": []
     }
   ],
-  "totals": { "accounts": 1, "requests": 17, "success": 16, "failed": 1, "tokens": { "...": 0 } }
+  "totals": { "accounts": 1, "requests": 17, "success": 16, "failed": 1, "tokens": { "...": 0 }, "cost_usd": 1.12999 }
 }
 ```
+
+`cost_usd` 只计已设单价的模型；没设单价的模型列在 `unpriced_models` 里。
 
 `total_tokens` 是该账号所有记录 `total_tokens` 之和（缓存计入输入、推理计入输出，不要再相加）。汇总要扫描范围内所有记录（约 1 秒 / 50 万条），数据量大时请带 `start`/`end` 或配置 `retention_days`。
 
@@ -139,14 +143,45 @@ GET /v0/management/plugins/usage-statistics/records?auth_index=<auth_index>&star
 
 ```jsonc
 {
-  "records": [ { "id": "…", "timestamp": "…", "auth_index": "…", "model": "…", "tokens": { "...": 0 }, "failed": false } ],
+  "records": [ { "id": "…", "timestamp": "…", "auth_index": "…", "model": "…", "tokens": { "...": 0 }, "failed": false, "cost_usd": 0.0712 } ],
   "next_cursor": "MjAyNi0xMC0yMlQwNjo0MD…"
 }
 ```
 
-`timestamp` 是请求开始时间，记录在请求完成后才写入，所以耗时长的请求会出现在已翻过的位置之后：游标适合浏览，不适合做增量同步的水位线。
+`timestamp` 是请求开始时间，记录在请求完成后才写入，所以耗时长的请求会出现在已翻过的位置之后：游标适合浏览，不适合做增量同步的水位线。每条记录的 `cost_usd` 在该模型没设单价时为 `null`。
+
+### 单价
+
+```
+GET /v0/management/plugins/usage-statistics/prices
+PUT /v0/management/plugins/usage-statistics/prices
+Content-Type: application/json
+
+{"prices": [{"model": "muse-wonder-full-1.0", "input": 5, "output": 25, "cache_read": 0.2, "cache_creation": 0}]}
+```
+
+- 单位是美元 / 百万 token，与配套面板相同。`GET` 另外返回 `models_seen`，即记录里出现过的模型。
+- `PUT` 整体替换单价表，传 `[]` 表示清空；请求体缺少 `prices` 键时返回 400，防止误清空。每个价须在 0–10000 之间，最多 500 个模型。
+- `PUT` 只接受 `{"prices": [...]}`，出现未知字段（例如面板里的 `cacheRead` 写法，或 `GET` 返回的 `models_seen`）一律返回 400，避免字段名写错时被当成 0 存进去。
+- 单价存在 `usage.db` 的 `model_prices` 表里。旧版本插件会忽略这张表，回滚后照样能打开数据库。
+
+### 花费口径
+
+与配套面板的 `calculateCost` 一致，但不含上下文阶梯价和 Tier 倍率：
+
+```
+纯输入 = provider 含 claude/anthropic ? input_tokens : max(input_tokens − cached_tokens − cache_creation_tokens, 0)
+花费   = (纯输入·input + cached_tokens·cache_read + cache_creation_tokens·cache_creation + output_tokens·output) / 1e6
+```
+
+修改单价会按新价重算全部历史花费。
+
+## 账号用量页面
+
+插件注册了一个面板菜单"账号用量"，页面路径 `/v0/resource/plugins/usage-statistics/ui`。配套面板和官方面板都会把它显示在侧边栏，并以 iframe 嵌入。页面本身不需要鉴权且不含任何数据，数据都通过上面那些需要管理密钥的接口获取。
 
 ## 说明
 
 - 本插件仅使用上游 `UsageRecord` ABI 现有字段。失败判定为 `Failed || failure_status_code >= 400`。
-- 不要热重载本插件（替换 `.so` 后靠配置热加载切换版本）：热重载时新旧两份插件各带一份 SQLite 同时打开同一个 `usage.db`，同一进程内的文件锁互不生效，会丢记录并损坏数据库。升级或回滚请停掉 CLIProxyAPI，换文件后再启动。
+- 升级或回滚请走"停用插件 → 替换 `.so` → 启用插件"：停用时宿主会先调用插件的 shutdown，关闭数据库，然后才加载新版本，所以不需要重启 CLIProxyAPI。停用期间产生的用量记录会丢失。
+- 不要在插件启用时直接替换 `.so` 并改配置（即热重载）。0.1.0 和 0.2.0-acct.1 在热重载时，新旧两份插件各带一份 SQLite 同时写同一个 `usage.db`，会丢记录并损坏数据库。从 0.3.0-acct.1 起，插件会在被替换前（`plugin.quiesce`）关闭数据库，热重载不再损坏数据库，但替换期间的记录仍会丢失。

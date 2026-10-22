@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -29,11 +30,11 @@ func TestAccountSummary(t *testing.T) {
 	store := newTestStore(t)
 	base := time.Date(2026, 5, 2, 10, 0, 0, 0, time.UTC)
 	insertAll(t, store,
-		Record{ID: "a1", Timestamp: base.Add(1 * time.Minute), AuthIndex: "idx-a", AuthID: "id-a", Source: "src-a", Provider: "claude", AuthType: "oauth", Tokens: tok(1, 2, 3, 4, 5, 6, 10)},
-		Record{ID: "a2", Timestamp: base.Add(3 * time.Minute), AuthIndex: "idx-a", AuthID: "id-a", Source: "src-a", Provider: "claude", AuthType: "oauth", Tokens: tok(10, 20, 30, 40, 50, 60, 100), Failed: true},
-		Record{ID: "a3", Timestamp: base.Add(2 * time.Minute), AuthIndex: "idx-a", AuthID: "id-a", Source: "src-a", Provider: "claude", AuthType: "oauth", Tokens: tok(100, 200, 300, 400, 500, 600, 1000)},
-		Record{ID: "b1", Timestamp: base.Add(5 * time.Minute), AuthIndex: "idx-b", AuthID: "id-b", Source: "src-b", Provider: "codex", AuthType: "apikey", Tokens: tok(1, 1, 1, 1, 1, 1, 5000)},
-		Record{ID: "b2", Timestamp: base.Add(4 * time.Minute), AuthIndex: "idx-b", AuthID: "id-b", Source: "src-b", Provider: "codex", AuthType: "apikey", Tokens: tok(2, 2, 2, 2, 2, 2, 7), Failed: true},
+		Record{ID: "a1", Timestamp: base.Add(1 * time.Minute), AuthIndex: "idx-a", AuthID: "id-a", Source: "src-a", Model: "m1", Provider: "claude", AuthType: "oauth", Tokens: tok(1, 2, 3, 4, 5, 6, 10)},
+		Record{ID: "a2", Timestamp: base.Add(3 * time.Minute), AuthIndex: "idx-a", AuthID: "id-a", Source: "src-a", Model: "m1", Provider: "claude", AuthType: "oauth", Tokens: tok(10, 20, 30, 40, 50, 60, 100), Failed: true},
+		Record{ID: "a3", Timestamp: base.Add(2 * time.Minute), AuthIndex: "idx-a", AuthID: "id-a", Source: "src-a", Model: "m1", Provider: "claude", AuthType: "oauth", Tokens: tok(100, 200, 300, 400, 500, 600, 1000)},
+		Record{ID: "b1", Timestamp: base.Add(5 * time.Minute), AuthIndex: "idx-b", AuthID: "id-b", Source: "src-b", Model: "m1", Provider: "codex", AuthType: "apikey", Tokens: tok(1, 1, 1, 1, 1, 1, 5000)},
+		Record{ID: "b2", Timestamp: base.Add(4 * time.Minute), AuthIndex: "idx-b", AuthID: "id-b", Source: "src-b", Model: "m1", Provider: "codex", AuthType: "apikey", Tokens: tok(2, 2, 2, 2, 2, 2, 7), Failed: true},
 	)
 	got, err := store.AccountSummary(context.Background(), QueryRange{})
 	if err != nil {
@@ -64,7 +65,8 @@ func TestAccountSummary(t *testing.T) {
 		}
 		c.got.FirstRequestAt, c.got.LastRequestAt = time.Time{}, time.Time{}
 		c.want.FirstRequestAt, c.want.LastRequestAt = time.Time{}, time.Time{}
-		if c.got != c.want {
+		c.want.UnpricedModels = []string{"m1"} // no prices configured
+		if !reflect.DeepEqual(c.got, c.want) {
 			t.Errorf("account = %+v\nwant     %+v", c.got, c.want)
 		}
 	}
@@ -166,7 +168,9 @@ func pageAll(t *testing.T, store *SQLiteStore, q RecordsQuery) []RequestDetail {
 		if len(page.Records) > q.Limit {
 			t.Fatalf("page too large: %d", len(page.Records))
 		}
-		all = append(all, page.Records...)
+		for _, r := range page.Records {
+			all = append(all, r.RequestDetail)
+		}
 		if page.NextCursor == nil {
 			return all
 		}
@@ -456,6 +460,7 @@ func TestManagementRegistrationRoutes(t *testing.T) {
 	want := map[string]bool{
 		"GET " + managementUsagePath: true, "DELETE " + managementUsagePath: true,
 		"GET " + managementAccountsPath: true, "GET " + managementRecordsPath: true,
+		"GET " + managementPricesPath: true, "PUT " + managementPricesPath: true,
 	}
 	if len(routes) != len(want) {
 		t.Fatalf("routes = %+v", routes)
@@ -464,6 +469,14 @@ func TestManagementRegistrationRoutes(t *testing.T) {
 		if !want[r.Method+" "+r.Path] {
 			t.Errorf("unexpected route %+v", r)
 		}
+	}
+	res := managementRegistration().Resources
+	if len(res) != 1 || res[0].Path != "/ui" || res[0].Menu != "账号用量" {
+		t.Errorf("resources = %+v", res)
+	}
+	raw, _ := json.Marshal(managementRegistration())
+	if !strings.Contains(string(raw), `"resources":[`) {
+		t.Errorf("json lacks resources: %s", raw)
 	}
 }
 
