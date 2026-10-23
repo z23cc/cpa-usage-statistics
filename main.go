@@ -32,6 +32,7 @@ const (
 	managementAccountsPath = "/plugins/" + pluginID + "/accounts"
 	managementRecordsPath  = "/plugins/" + pluginID + "/records"
 	managementPricesPath   = "/plugins/" + pluginID + "/prices"
+	managementHealthPath   = "/plugins/" + pluginID + "/health"
 	// Resource routes are served by the host under resourceBasePath without
 	// management authentication, so only the static page may live there.
 	resourceBasePath = "/v0/resource/plugins/" + pluginID + "/"
@@ -52,7 +53,7 @@ const (
 
 // Overridable at build time via -ldflags "-X main.pluginVersion=...".
 var (
-	pluginVersion    = "0.5.0-acct.1"
+	pluginVersion    = "0.6.0-acct.1"
 	pluginAuthor     = "Fwindy"
 	pluginRepository = "https://github.com/Fwindy/cpa-usage-statistics"
 )
@@ -147,6 +148,7 @@ func registerResponse() registerResponsePayload {
 			ConfigFields: []configFieldInfo{
 				{Name: "data_dir", Type: "string", Description: "Directory for usage.db. Defaults to ~/.cli-proxy-api/plugins/usage-statistics."},
 				{Name: "retention_days", Type: "integer", Description: "Delete per-request records older than this many days (hourly/daily rollups are kept). 0 disables cleanup."},
+				{Name: "meta_auto_disable", Type: "boolean", Description: "After a Muse (meta) 401, swap the key with the credential's dca_token; disable the credential file only when Meta refuses the swap or rejects the new key."},
 			},
 		},
 		Capabilities: capabilitiesInfo{UsagePlugin: true, ManagementAPI: true},
@@ -181,6 +183,7 @@ func managementRegistration() managementRegistrationPayload {
 			{Method: "GET", Path: managementRecordsPath, Description: "Page persisted usage records newest first, optionally for one credential."},
 			{Method: "GET", Path: managementPricesPath, Description: "List model prices (USD per 1M tokens) and the models seen."},
 			{Method: "PUT", Path: managementPricesPath, Description: "Replace all model prices."},
+			{Method: "GET", Path: managementHealthPath, Description: "Muse auto-disable state and each credential's latest failure."},
 		},
 		Resources: []resourceRoute{
 			{Path: accountsPagePath, Menu: accountsPageMenu, Description: "Per-account usage, cost and request details."},
@@ -239,8 +242,12 @@ func handleUsage(request []byte) ([]byte, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), insertTimeout)
 	defer cancel()
-	if err := store.Insert(ctx, toRecord(rec)); err != nil {
+	record := toRecord(rec)
+	if err := store.Insert(ctx, record); err != nil {
 		return nil, err
+	}
+	if healthRunning.Load() {
+		observeUsage(ctx, store, record, healthNow())
 	}
 	return okEnvelope(map[string]any{"stored": true})
 }
@@ -344,6 +351,11 @@ func handleManagement(request []byte) ([]byte, error) {
 			return okEnvelope(jsonManagementResponse(405, map[string]string{"error": "method not allowed"}))
 		}
 		return recordsGet(req)
+	case strings.HasSuffix(req.Path, managementHealthPath):
+		if method != "GET" {
+			return okEnvelope(jsonManagementResponse(405, map[string]string{"error": "method not allowed"}))
+		}
+		return healthGet()
 	}
 	switch method {
 	case "GET":
@@ -637,9 +649,10 @@ func currentStore() *SQLiteStore {
 	return globalStore
 }
 
-// closeStore stops the cleanup, detaches the store so new callers see nil at
-// once, then waits for in-flight work in Close without holding storeMu.
+// closeStore stops the background workers, detaches the store so new callers
+// see nil at once, then waits for in-flight work in Close without holding storeMu.
 func closeStore() {
+	stopHealth()
 	stopCleanup()
 	storeMu.Lock()
 	store := globalStore
@@ -743,10 +756,12 @@ func configurePlugin(request []byte) error {
 		return err
 	}
 	cfg := parseConfig(raw)
-	// Stop the cleanup before ensureStore may close the current store (a
+	// Stop the workers before ensureStore may close the current store (a
 	// data_dir change), so Close never competes with a running batch.
+	stopHealth()
 	stopCleanup()
 	retentionDays.Store(int64(cfg.RetentionDays))
+	metaAutoDisable.Store(cfg.MetaAutoDisable)
 	if err := ensureStore(cfg); err != nil {
 		return err
 	}
@@ -754,6 +769,7 @@ func configurePlugin(request []byte) error {
 	// has just reopened the store, so resume normal service.
 	quiesced.Store(false)
 	startCleanup()
+	startHealth()
 	return nil
 }
 

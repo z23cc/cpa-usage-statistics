@@ -15,6 +15,8 @@ import (
 type pluginConfig struct {
 	DataDir       string
 	RetentionDays int
+	// MetaAutoDisable turns on the Muse 401 key swap / auto-disable (health.go).
+	MetaAutoDisable bool
 }
 
 // parseConfig reads the plugin config YAML block, accepting English keys and
@@ -34,7 +36,23 @@ func parseConfig(raw []byte) pluginConfig {
 	if v, ok := lookupConfig(m, "retention_days", "用量保留天数"); ok {
 		cfg.RetentionDays = toConfigInt(v)
 	}
+	if v, ok := lookupConfig(m, "meta_auto_disable", "Muse自动停用"); ok {
+		cfg.MetaAutoDisable = toConfigBool(v)
+	}
 	return cfg
+}
+
+func toConfigBool(v any) bool {
+	switch b := v.(type) {
+	case bool:
+		return b
+	case int:
+		return b != 0
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(b))
+		return err == nil && parsed
+	}
+	return false
 }
 
 // resolveDBPath resolves the usage.db path: config data_dir, then the

@@ -463,6 +463,7 @@ func TestManagementRegistrationRoutes(t *testing.T) {
 		"GET " + managementUsagePath: true, "DELETE " + managementUsagePath: true,
 		"GET " + managementAccountsPath: true, "GET " + managementRecordsPath: true,
 		"GET " + managementPricesPath: true, "PUT " + managementPricesPath: true,
+		"GET " + managementHealthPath: true,
 	}
 	if len(routes) != len(want) {
 		t.Fatalf("routes = %+v", routes)

@@ -163,6 +163,9 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 	if err := s.initPriceSchema(ctx); err != nil {
 		return err
 	}
+	if err := s.initHealthSchema(ctx); err != nil {
+		return err
+	}
 	// Last: the rollup triggers read columns migrateSchema may have just added.
 	return s.initRollup(ctx)
 }

@@ -35,10 +35,37 @@ typedef struct {
 extern int cliproxyPluginCall(char*, uint8_t*, size_t, cliproxy_buffer*);
 extern void cliproxyPluginFree(void*, size_t);
 extern void cliproxyPluginShutdown(void);
+
+// Set once at init and never cleared: the host deliberately never frees this
+// table (internal/pluginhost/loader_unix.go), and after unload its callback
+// fails the lookup by itself, so a late call is harmless.
+static const cliproxy_host_api* stored_host;
+
+static void store_host_api(const cliproxy_host_api* host) {
+	stored_host = host;
+}
+
+static int call_host_api(const char* method, const uint8_t* request, size_t request_len, cliproxy_buffer* response) {
+	const cliproxy_host_api* host = stored_host;
+	if (host == NULL || host->call == NULL) {
+		return 1;
+	}
+	return host->call(host->host_ctx, method, request, request_len, response);
+}
+
+static void free_host_buffer(void* ptr, size_t len) {
+	const cliproxy_host_api* host = stored_host;
+	if (host != NULL && host->free_buffer != NULL && ptr != NULL) {
+		host->free_buffer(ptr, len);
+	}
+}
 */
 import "C"
 
-import "unsafe"
+import (
+	"fmt"
+	"unsafe"
+)
 
 //export cliproxy_plugin_init
 func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
@@ -49,7 +76,10 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
 	plugin.shutdown = C.cliproxy_plugin_shutdown_fn(C.cliproxyPluginShutdown)
-	_ = host
+	if host != nil {
+		C.store_host_api(host)
+		hostCallFn = cgoCallHost
+	}
 	return 0
 }
 
@@ -86,6 +116,7 @@ func cliproxyPluginFree(ptr unsafe.Pointer, length C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
+	// closeStore stops the health worker and waits for it.
 	closeStore()
 }
 
@@ -99,4 +130,26 @@ func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 	}
 	response.ptr = ptr
 	response.len = C.size_t(len(raw))
+}
+
+// cgoCallHost calls one host callback and copies its response into Go memory.
+func cgoCallHost(method string, payload []byte) ([]byte, error) {
+	cMethod := C.CString(method)
+	defer C.free(unsafe.Pointer(cMethod))
+	var request *C.uint8_t
+	if len(payload) > 0 {
+		request = (*C.uint8_t)(C.CBytes(payload))
+		defer C.free(unsafe.Pointer(request))
+	}
+	var response C.cliproxy_buffer
+	rc := C.call_host_api(cMethod, request, C.size_t(len(payload)), &response)
+	var out []byte
+	if response.ptr != nil {
+		out = C.GoBytes(response.ptr, C.int(response.len))
+		C.free_host_buffer(response.ptr, response.len)
+	}
+	if rc != 0 && len(out) == 0 {
+		return nil, fmt.Errorf("host call %s failed (rc=%d)", method, int(rc))
+	}
+	return out, nil
 }

@@ -39,9 +39,11 @@ plugins:
       data_dir: ""
       # 可选：逐条明细的保留天数，超过的明细在后台分批清理；小时/天汇总不清理；0 表示不清理
       retention_days: 0
+      # 可选：Muse（meta）账号 401 后自动换 key，换不成功才停用；默认关闭，见下文「Muse 账号 401 自动停用」
+      meta_auto_disable: false
 ```
 
-`data_dir` 也可用环境变量 `USAGE_STATISTICS_DIR` 指定。中文配置键 `用量保留天数`、`数据目录` 同样可用。
+`data_dir` 也可用环境变量 `USAGE_STATISTICS_DIR` 指定。中文配置键 `用量保留天数`、`数据目录`、`Muse自动停用` 同样可用。
 
 ## 存储
 
@@ -52,6 +54,9 @@ plugins:
 | `usage_records` | 每个请求一行的明细 | `retention_days` |
 | `usage_hourly` / `usage_daily` | 按 UTC 小时 / 天 × 账号（`auth_index` + `auth_id`）× 模型汇总的请求数、失败数、各类 token、首末请求时间 | 永久 |
 | `model_prices` | 单价 | 永久 |
+| `account_last_failure` | 每个账号最近一次失败的状态码、报错（≤300 字）和时间，由触发器维护 | 每个账号一行 |
+| `account_health` | Muse 自动停用正在跟踪的账号 | 恢复或解除停用后删除 |
+| `plugin_meta` | 一次性迁移的完成标记 | 永久 |
 
 - **汇总表由触发器维护：** 写入明细时累加；按 id 删除明细时扣减；`retention_days` 清理时不扣减。
 - **账号汇总的算法：** 整天读天表，零头整小时读小时表，两端不足一小时的部分读明细。所以耗时和明细总量无关。
@@ -204,6 +209,30 @@ Content-Type: application/json
 ```
 
 修改单价会按新价重算全部历史花费。
+
+### 账号健康
+
+```
+GET /v0/management/plugins/usage-statistics/health
+```
+
+返回 `auto_disable`（开关状态）、`accounts`（自动停用正在跟踪的账号：`state` 为 `pending` / `retry` / `minted` / `disabled`，以及 `reason`、`http_status`、`message`、`since`、`updated_at`），以及 `last_failures`（24 小时内每个账号最近一次失败：`status_code`、`message`、`at`）。两个列表都是数组，元素用 `auth_id`（凭证文件名）标识。`last_failures` 不受开关影响。
+
+## Muse 账号 401 自动停用
+
+`meta_auto_disable: true` 时生效。CLIProxyAPI 自己会在 401 的请求里用 `dca_token` 当场换一次 key，换不成功就只在内存里把账号挡在调度外：面板显示 `error`、没有说明，重启后还会再吃一次 401。插件接着处理：
+
+1. Muse 账号收到 401 后等 2 分钟。期间如果有新请求成功，或者 CLIProxyAPI 已经换过 key，就不处理。
+2. 否则插件用账号文件里的 `dca_token` 调 Meta 的换 key 接口（`META_MINT_URL`，缺省 `https://api.meta.ai/muse-code/key`，和 CLIProxyAPI 一致），请求走宿主的 HTTP 客户端，出口与 CLIProxyAPI 相同。
+   - 换成功：把新 key 写回账号文件，CLIProxyAPI 随即解除封锁。之后 24 小时内，用新 key 发出的请求如果又是 401，就停用。
+   - Meta 回 401 / 403，或者文件里没有 `dca_token`：停用。
+   - 网络错误、5xx：不停用，按 5 分钟、15 分钟、30 分钟、1 小时退避重试，之后每小时一次。
+3. 停用就是在账号文件里写 `disabled: true`，并加上 `disabled_by: "usage-statistics"`、`disabled_reason`（`mint_rejected` / `new_key_rejected` / `no_dca_token` / `backfill_401`）、`disabled_at`。重新登录的程序可以根据这个标记区分自动停用和人工停用。
+4. 开关打开后第一次启动时执行一次迁移：最近 7 天里最后一条记录是 Muse 401 的账号，如果已经停用，就补上标记（原因 `backfill_401`）；如果没停用，就马上检查。
+
+账号被重新启用（重新登录，或在面板里启用）后，插件最多 5 分钟内会把标记从文件里去掉，以免之后的人工停用被当成自动停用。停用前如果发现文件已被别人停用，插件就不再改它。
+
+插件只通过宿主接口读写账号文件，`dca_token` 和 key 不进数据库、不写日志、不出现在接口返回里。写文件前会核对凭证有没有变化，期间有人重新登录就放弃写入。插件不设批量停用的上限：如果 Meta 的换 key 接口对所有账号都回 401，所有账号都会被停用。要关掉这个功能，按下文"停用插件 → 改配置 → 启用插件"把开关改回 `false`。
 
 ## 账号用量页面
 

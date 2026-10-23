@@ -160,6 +160,36 @@ type RecordsPage struct {
 	Total      *int64         `json:"total,omitempty"`
 }
 
+// HealthResponse is the body of GET /plugins/usage-statistics/health. Arrays,
+// not maps keyed by file name: the host HTML-escapes string values only.
+type HealthResponse struct {
+	AutoDisable  bool             `json:"auto_disable"`
+	Accounts     []AccountHealth  `json:"accounts"`
+	LastFailures []AccountFailure `json:"last_failures"`
+}
+
+// AccountHealth is one tracked Muse credential (see health.go). Message is
+// Meta's raw error text; it never contains credential material.
+type AccountHealth struct {
+	AuthID     string    `json:"auth_id"`
+	AuthIndex  string    `json:"auth_index"`
+	State      string    `json:"state"`
+	Reason     string    `json:"reason"`
+	HTTPStatus int       `json:"http_status"`
+	Message    string    `json:"message"`
+	Since      time.Time `json:"since"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// AccountFailure is a credential's most recent failed request.
+type AccountFailure struct {
+	AuthID     string    `json:"auth_id"`
+	AuthIndex  string    `json:"auth_index"`
+	StatusCode int       `json:"status_code"`
+	Message    string    `json:"message"`
+	At         time.Time `json:"at"`
+}
+
 // ModelPrice is one model's price in USD per 1M tokens, the panel's unit.
 type ModelPrice struct {
 	Model         string    `json:"model"`
