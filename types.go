@@ -125,6 +125,10 @@ type AccountsResponse struct {
 	// DetailsSince is the earliest retained record (null with none). Ranges
 	// before it come from the rollups only and start on the hour.
 	DetailsSince *time.Time `json:"details_since"`
+	// CostsFixed is always true: every cost_usd is the sum of costs fixed when each
+	// request was written, so a later price change never changes it. Consumers that
+	// book usage can rely on cost growth instead of pricing token growth themselves.
+	CostsFixed bool `json:"costs_fixed"`
 }
 
 // RecordsQuery selects one page of records, newest first.

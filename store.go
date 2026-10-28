@@ -352,7 +352,7 @@ func (s *SQLiteStore) Query(ctx context.Context, rng QueryRange) (APIUsage, erro
 // planSummaryPieces), all read in one snapshot. Groups stay per model so each
 // model's price applies to its own tokens; they are merged per account here.
 func (s *SQLiteStore) AccountSummary(ctx context.Context, rng QueryRange) (AccountsResponse, error) {
-	result := AccountsResponse{Accounts: []AccountUsage{}}
+	result := AccountsResponse{Accounts: []AccountUsage{}, CostsFixed: true}
 	if s == nil || s.rdb == nil {
 		return result, nil
 	}

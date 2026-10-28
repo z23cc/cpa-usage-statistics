@@ -114,7 +114,7 @@ func scalarInt(t testing.TB, db *sql.DB, query string, args ...any) int64 {
 // one plain GROUP BY over usage_records.
 func refAccountSummary(tb testing.TB, s *SQLiteStore, rng QueryRange) AccountsResponse {
 	tb.Helper()
-	result := AccountsResponse{Accounts: []AccountUsage{}}
+	result := AccountsResponse{Accounts: []AccountUsage{}, CostsFixed: true}
 	where, args := rangeWhere(rng)
 	query := `
 SELECT auth_index, auth_id, model, MAX(source), MAX(provider), MAX(auth_type),
