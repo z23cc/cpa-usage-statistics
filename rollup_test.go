@@ -122,7 +122,8 @@ SELECT auth_index, auth_id, model, MAX(source), MAX(provider), MAX(auth_type),
        SUM(input_tokens), SUM(output_tokens), SUM(reasoning_tokens), SUM(cached_tokens),
        SUM(cache_read_tokens), SUM(cache_creation_tokens), SUM(total_tokens),
        SUM(` + pureInputSQL + `),
-       MIN(timestamp), MAX(timestamp)
+       MIN(timestamp), MAX(timestamp),
+       SUM(COALESCE(cost_usd, 0)), SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END)
 FROM usage_records`
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
@@ -138,12 +139,13 @@ FROM usage_records`
 	for rows.Next() {
 		var group AccountUsage
 		var model, firstText, lastText string
-		var pureInput int64
+		var pureInput, unpriced int64
+		var cost float64
 		if err := rows.Scan(&group.AuthIndex, &group.AuthID, &model, &group.Source, &group.Provider, &group.AuthType,
 			&group.Requests, &group.Failed,
 			&group.Tokens.InputTokens, &group.Tokens.OutputTokens, &group.Tokens.ReasoningTokens, &group.Tokens.CachedTokens,
 			&group.Tokens.CacheReadTokens, &group.Tokens.CacheCreationTokens, &group.Tokens.TotalTokens,
-			&pureInput, &firstText, &lastText); err != nil {
+			&pureInput, &firstText, &lastText, &cost, &unpriced); err != nil {
 			tb.Fatal(err)
 		}
 		group.FirstRequestAt, _ = parseStoredTimestamp(firstText)
@@ -160,12 +162,13 @@ FROM usage_records`
 		} else {
 			mergeAccountGroup(account, group)
 		}
-		if price, ok := s.priceFor(model); ok {
-			cost := costUSD(price, pureInput, group.Tokens.CachedTokens, group.Tokens.CacheCreationTokens, group.Tokens.OutputTokens)
+		// Costs are the ones fixed when each record was written.
+		if group.Requests > unpriced {
 			account.CostUSD += cost
 			rounded := roundUSD(cost)
 			modelUsage.CostUSD = &rounded
-		} else {
+		}
+		if unpriced > 0 {
 			account.UnpricedModels = append(account.UnpricedModels, model)
 		}
 		account.Models = append(account.Models, modelUsage)
@@ -259,11 +262,12 @@ func TestAccountSummaryEquivalentToGroupBy(t *testing.T) {
 	store := newTestStore(t)
 	rng := rand.New(rand.NewSource(20260310))
 	base := utc(10, 0, 0, 0)
-	insertBulk(t, store, randomRecords(rng, base, 4, 3000))
+	// Prices first: costs are fixed when a record is written.
 	putPrices(t, store,
 		ModelPrice{Model: "priced-a", Input: 2, Output: 8, CacheRead: 0.5, CacheCreation: 1},
 		ModelPrice{Model: "priced-b", Input: 3.5, Output: 7.25, CacheRead: 0.1, CacheCreation: 0.7},
 		ModelPrice{Model: "claude-x", Input: 15, Output: 75, CacheRead: 1.5, CacheCreation: 18.75})
+	insertBulk(t, store, randomRecords(rng, base, 4, 3000))
 	assertRollupsMatchDetails(t, store)
 
 	randMinute := func() time.Time { // -6h .. 4d+6h, minute precision

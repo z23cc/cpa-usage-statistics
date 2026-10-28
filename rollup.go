@@ -9,8 +9,12 @@ import (
 )
 
 // rollupSchemaVersion is stored in PRAGMA user_version once the hourly and
-// daily rollups, their triggers and the backfill are in place.
-const rollupSchemaVersion = 1
+// daily rollups, their triggers and the backfill are in place. Version 1 had
+// token sums only; version 2 adds the costs fixed when each record was written.
+const (
+	rollupBaseVersion   = 1
+	rollupSchemaVersion = 2
+)
 
 const (
 	hourBucketLayout = "2006-01-02T15"
@@ -63,6 +67,18 @@ func (s *SQLiteStore) initRollup(ctx context.Context) error {
 	if version >= rollupSchemaVersion {
 		return nil
 	}
+	if version < rollupBaseVersion {
+		if err := s.initRollupBase(ctx); err != nil {
+			return err
+		}
+	}
+	return s.migrateRollupCost(ctx)
+}
+
+// initRollupBase creates the rollups (or restores a lost user_version) and leaves
+// the database at rollupBaseVersion; migrateRollupCost then brings it to the
+// current version.
+func (s *SQLiteStore) initRollupBase(ctx context.Context) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("usage sqlite rollup begin: %w", err)
@@ -75,7 +91,7 @@ func (s *SQLiteStore) initRollup(ctx context.Context) error {
 		return fmt.Errorf("usage sqlite rollup inspect: %w", err)
 	}
 	if triggers == 2 && tables == 2 {
-		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, rollupSchemaVersion)); err != nil {
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, rollupBaseVersion)); err != nil {
 			return fmt.Errorf("usage sqlite rollup version restore: %w", err)
 		}
 		return tx.Commit()
@@ -110,7 +126,7 @@ func (s *SQLiteStore) initRollup(ctx context.Context) error {
 		`DELETE FROM usage_daily`,
 		rollupBackfillSQL(hourlyRollup),
 		rollupBackfillSQL(dailyRollup),
-		fmt.Sprintf(`PRAGMA user_version = %d`, rollupSchemaVersion),
+		fmt.Sprintf(`PRAGMA user_version = %d`, rollupBaseVersion),
 	}
 	for _, statement := range statements {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -121,6 +137,89 @@ func (s *SQLiteStore) initRollup(ctx context.Context) error {
 		return fmt.Errorf("usage sqlite rollup commit: %w", err)
 	}
 	return nil
+}
+
+// migrateRollupCost brings a version-1 database to version 2 in one transaction:
+// it adds the cost columns to the rollups, recomputes each rollup's cost from its
+// records and reinstalls the triggers. Records written before this version carry
+// no stored cost and stay unpriced: a cost is only ever the one fixed when a
+// record was written, never one derived later from a newer price. It is idempotent.
+func (s *SQLiteStore) migrateRollupCost(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("usage sqlite rollup cost begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, t := range rollupTables {
+		columns, err := sqliteColumnSet(ctx, tx, t.name)
+		if err != nil {
+			return err
+		}
+		for _, add := range []struct{ name, ddl string }{
+			{"cost_usd", "ALTER TABLE " + t.name + " ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0"},
+			{"unpriced_requests", "ALTER TABLE " + t.name + " ADD COLUMN unpriced_requests INTEGER NOT NULL DEFAULT 0"},
+		} {
+			if _, ok := columns[add.name]; ok {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, add.ddl); err != nil {
+				return fmt.Errorf("usage sqlite rollup cost add %s.%s: %w", t.name, add.name, err)
+			}
+		}
+	}
+	for _, t := range rollupTables {
+		statements := []string{
+			"UPDATE " + t.name + " SET cost_usd = 0, unpriced_requests = requests",
+			fmt.Sprintf(`UPDATE %[1]s SET cost_usd = agg.cost, unpriced_requests = MAX(%[1]s.requests - agg.priced, 0)
+FROM (SELECT substr(timestamp, 1, %[2]d) AS bucket, auth_index, auth_id, model,
+	SUM(COALESCE(cost_usd, 0)) AS cost, SUM(CASE WHEN cost_usd IS NULL THEN 0 ELSE 1 END) AS priced
+	FROM usage_records GROUP BY 1, 2, 3, 4) AS agg
+WHERE %[1]s.bucket = agg.bucket AND %[1]s.auth_index = agg.auth_index AND %[1]s.auth_id = agg.auth_id AND %[1]s.model = agg.model`,
+				t.name, t.bucketLen),
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("usage sqlite rollup cost recompute %s: %w", t.name, err)
+			}
+		}
+	}
+	for _, statement := range []string{
+		`DROP TRIGGER IF EXISTS usage_records_rollup_ai`,
+		`DROP TRIGGER IF EXISTS usage_records_rollup_ad`,
+		rollupInsertTrigger(),
+		rollupDeleteTrigger(),
+		fmt.Sprintf(`PRAGMA user_version = %d`, rollupSchemaVersion),
+	} {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("usage sqlite rollup cost triggers: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("usage sqlite rollup cost commit: %w", err)
+	}
+	return nil
+}
+
+// sqliteColumnSet returns the column names of table.
+func sqliteColumnSet(ctx context.Context, tx *sql.Tx, table string) (map[string]struct{}, error) {
+	rows, err := tx.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return nil, fmt.Errorf("usage sqlite table_info %s: %w", table, err)
+	}
+	defer func() { _ = rows.Close() }()
+	columns := make(map[string]struct{})
+	for rows.Next() {
+		var (
+			cid, notNull, pk int
+			name, ctype      string
+			dflt             sql.NullString
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			return nil, fmt.Errorf("usage sqlite table_info %s scan: %w", table, err)
+		}
+		columns[name] = struct{}{}
+	}
+	return columns, rows.Err()
 }
 
 func rollupTableDDL(t rollupTable) string {
@@ -135,6 +234,7 @@ func rollupTableDDL(t rollupTable) string {
 	columns = append(columns,
 		"pure_input_tokens INTEGER NOT NULL DEFAULT 0",
 		"first_ts TEXT NOT NULL", "last_ts TEXT NOT NULL",
+		"cost_usd REAL NOT NULL DEFAULT 0", "unpriced_requests INTEGER NOT NULL DEFAULT 0",
 		"PRIMARY KEY (bucket, auth_index, auth_id, model)")
 	return "CREATE TABLE IF NOT EXISTS " + t.name + " (\n\t" + strings.Join(columns, ",\n\t") + "\n) WITHOUT ROWID"
 }
@@ -163,10 +263,12 @@ func rollupUpsertSQL(t rollupTable) string {
 		values = append(values, "NEW."+column)
 		updates = append(updates, column+" = "+column+" + excluded."+column)
 	}
-	columns = append(columns, "pure_input_tokens", "first_ts", "last_ts")
-	values = append(values, pureInputExpr("NEW."), "NEW.timestamp", "NEW.timestamp")
+	columns = append(columns, "pure_input_tokens", "first_ts", "last_ts", "cost_usd", "unpriced_requests")
+	values = append(values, pureInputExpr("NEW."), "NEW.timestamp", "NEW.timestamp",
+		"COALESCE(NEW.cost_usd, 0)", "CASE WHEN NEW.cost_usd IS NULL THEN 1 ELSE 0 END")
 	updates = append(updates, "pure_input_tokens = pure_input_tokens + excluded.pure_input_tokens",
-		"first_ts = min(first_ts, excluded.first_ts)", "last_ts = max(last_ts, excluded.last_ts)")
+		"first_ts = min(first_ts, excluded.first_ts)", "last_ts = max(last_ts, excluded.last_ts)",
+		"cost_usd = cost_usd + excluded.cost_usd", "unpriced_requests = unpriced_requests + excluded.unpriced_requests")
 	return "INSERT INTO " + t.name + " (" + strings.Join(columns, ", ") + ") VALUES (" + strings.Join(values, ", ") + ")\n" +
 		"ON CONFLICT (bucket, auth_index, auth_id, model) DO UPDATE SET " + strings.Join(updates, ", ")
 }
@@ -179,7 +281,9 @@ func rollupDecrementSQL(t rollupTable) string {
 	for _, column := range rollupSumColumns {
 		sets = append(sets, column+" = "+column+" - OLD."+column)
 	}
-	sets = append(sets, "pure_input_tokens = pure_input_tokens - ("+pureInputExpr("OLD.")+")")
+	sets = append(sets, "pure_input_tokens = pure_input_tokens - ("+pureInputExpr("OLD.")+")",
+		"cost_usd = cost_usd - COALESCE(OLD.cost_usd, 0)",
+		"unpriced_requests = unpriced_requests - CASE WHEN OLD.cost_usd IS NULL THEN 1 ELSE 0 END")
 	return "UPDATE " + t.name + " SET " + strings.Join(sets, ", ") + " WHERE " + key + ";\n" +
 		"DELETE FROM " + t.name + " WHERE " + key + " AND requests <= 0"
 }
@@ -190,9 +294,10 @@ func rollupBackfillSQL(t rollupTable) string {
 		sums = append(sums, "SUM("+column+")")
 	}
 	return "INSERT INTO " + t.name + " (bucket, auth_index, auth_id, model, source, provider, auth_type, requests, " +
-		strings.Join(rollupSumColumns, ", ") + ", pure_input_tokens, first_ts, last_ts)\n" +
+		strings.Join(rollupSumColumns, ", ") + ", pure_input_tokens, first_ts, last_ts, cost_usd, unpriced_requests)\n" +
 		fmt.Sprintf("SELECT substr(timestamp, 1, %d), auth_index, auth_id, model, MAX(source), MAX(provider), MAX(auth_type), COUNT(*), ", t.bucketLen) +
-		strings.Join(sums, ", ") + ", SUM(" + pureInputSQL + "), MIN(timestamp), MAX(timestamp)\n" +
+		strings.Join(sums, ", ") + ", SUM(" + pureInputSQL + "), MIN(timestamp), MAX(timestamp), " +
+		"SUM(COALESCE(cost_usd, 0)), SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END)\n" +
 		"FROM usage_records GROUP BY 1, 2, 3, 4"
 }
 
@@ -310,6 +415,9 @@ type summaryGroup struct {
 	tokens                     TokenStats
 	pureInput                  int64
 	first, last                string
+	// cost sums the costs fixed at write time; unpriced counts requests written without a price.
+	cost     float64
+	unpriced int64
 }
 
 type summaryGroupKey struct{ authIndex, authID, model string }
@@ -322,10 +430,12 @@ func summaryPieceSQL(piece summaryPiece) (string, []any) {
 		sums = append(sums, "SUM("+column+")")
 	}
 	if piece.table == rawSummaryKey {
-		selectCols = "COUNT(*), " + strings.Join(sums, ", ") + ", SUM(" + pureInputSQL + "), MIN(timestamp), MAX(timestamp)"
+		selectCols = "COUNT(*), " + strings.Join(sums, ", ") + ", SUM(" + pureInputSQL + "), MIN(timestamp), MAX(timestamp), " +
+			"SUM(COALESCE(cost_usd, 0)), SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END)"
 		boundCol = "timestamp"
 	} else {
-		selectCols = "SUM(requests), " + strings.Join(sums, ", ") + ", SUM(pure_input_tokens), MIN(first_ts), MAX(last_ts)"
+		selectCols = "SUM(requests), " + strings.Join(sums, ", ") + ", SUM(pure_input_tokens), MIN(first_ts), MAX(last_ts), " +
+			"SUM(cost_usd), SUM(unpriced_requests)"
 		boundCol = "bucket"
 	}
 	query := "SELECT auth_index, auth_id, model, MAX(source), MAX(provider), MAX(auth_type), " + selectCols + " FROM " + piece.table
@@ -361,7 +471,7 @@ func scanSummaryPiece(ctx context.Context, tx *sql.Tx, piece summaryPiece, group
 			&g.requests, &g.failed,
 			&g.tokens.InputTokens, &g.tokens.OutputTokens, &g.tokens.ReasoningTokens, &g.tokens.CachedTokens,
 			&g.tokens.CacheReadTokens, &g.tokens.CacheCreationTokens, &g.tokens.TotalTokens,
-			&g.pureInput, &g.first, &g.last); err != nil {
+			&g.pureInput, &g.first, &g.last, &g.cost, &g.unpriced); err != nil {
 			return fmt.Errorf("usage sqlite summary scan: %w", err)
 		}
 		mergeSummaryGroup(groups, &g)
@@ -395,6 +505,8 @@ func scanCleanedHour(ctx context.Context, tx *sql.Tx, hour string, groups map[su
 			cleaned.requests -= k.requests
 			cleaned.failed -= k.failed
 			cleaned.pureInput -= k.pureInput
+			cleaned.cost -= k.cost
+			cleaned.unpriced -= k.unpriced
 			cleaned.tokens = TokenStats{
 				InputTokens:         cleaned.tokens.InputTokens - k.tokens.InputTokens,
 				OutputTokens:        cleaned.tokens.OutputTokens - k.tokens.OutputTokens,
@@ -428,6 +540,8 @@ func mergeSummaryGroup(groups map[summaryGroupKey]*summaryGroup, g *summaryGroup
 	existing.failed += g.failed
 	addTokens(&existing.tokens, g.tokens)
 	existing.pureInput += g.pureInput
+	existing.cost += g.cost
+	existing.unpriced += g.unpriced
 	existing.first = min(existing.first, g.first)
 	existing.last = max(existing.last, g.last)
 }

@@ -38,7 +38,7 @@ const (
 const recordColumns = `id, timestamp, api_key, provider, model, alias, source, auth_id, auth_index, auth_type, executor_type,
        reasoning_effort, service_tier, latency_ms, ttft_ms,
        input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens, total_tokens,
-       failed, failure_status_code, failure_body`
+       failed, failure_status_code, failure_body, cost_usd`
 
 // errInvalidCursor reports a records cursor that was not produced by this plugin.
 var errInvalidCursor = errors.New("invalid cursor")
@@ -142,7 +142,8 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 	total_tokens INTEGER NOT NULL DEFAULT 0 CHECK (total_tokens >= 0),
 	failed INTEGER NOT NULL DEFAULT 0 CHECK (failed IN (0, 1)),
 	failure_status_code INTEGER NOT NULL DEFAULT 0 CHECK (failure_status_code >= 0),
-	failure_body TEXT NOT NULL DEFAULT ''
+	failure_body TEXT NOT NULL DEFAULT '',
+	cost_usd REAL
 )`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_records_timestamp ON usage_records(timestamp)`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_records_api_model ON usage_records(api_key, provider, model)`,
@@ -207,6 +208,9 @@ func (s *SQLiteStore) migrateSchema(ctx context.Context) error {
 		{"failed", `ALTER TABLE usage_records ADD COLUMN failed INTEGER NOT NULL DEFAULT 0`},
 		{"failure_status_code", `ALTER TABLE usage_records ADD COLUMN failure_status_code INTEGER NOT NULL DEFAULT 0`},
 		{"failure_body", `ALTER TABLE usage_records ADD COLUMN failure_body TEXT NOT NULL DEFAULT ''`},
+		// The cost of a record at the price in effect when it was written; NULL when its model
+		// had no price then. Nullable on purpose: NULL (unpriced) and 0 (free) differ.
+		{"cost_usd", `ALTER TABLE usage_records ADD COLUMN cost_usd REAL`},
 	}
 	for _, addition := range additions {
 		if _, ok := existing[addition.name]; ok {
@@ -256,19 +260,27 @@ func (s *SQLiteStore) Insert(ctx context.Context, record Record) error {
 	tokens := nonNegativeTokenStats(record.Tokens)
 	tokens.TotalTokens = normalizeTotalTokens(tokens)
 
+	// The cost is fixed now, at the price in effect for this request: a later price change
+	// only prices the requests after it. NULL when the model has no price yet.
+	model := normalizeModel(record.Model)
+	var cost any
+	if price, ok := s.priceFor(model); ok {
+		cost = costUSD(price, pureInputTokens(record.Provider, tokens), tokens.CachedTokens, tokens.CacheCreationTokens, tokens.OutputTokens)
+	}
+
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO usage_records (
 	id, timestamp, api_key, provider, model, alias, source, auth_id, auth_index, auth_type, executor_type,
 	reasoning_effort, service_tier, latency_ms, ttft_ms,
 	input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens, total_tokens,
-	failed, failure_status_code, failure_body
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	failed, failure_status_code, failure_body, cost_usd
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `,
 		strings.TrimSpace(record.ID),
 		formatRecordTimestamp(record.Timestamp),
 		strings.TrimSpace(record.APIKey),
 		strings.TrimSpace(record.Provider),
-		normalizeModel(record.Model),
+		model,
 		strings.TrimSpace(record.Alias),
 		strings.TrimSpace(record.Source),
 		strings.TrimSpace(record.AuthID),
@@ -289,6 +301,7 @@ INSERT INTO usage_records (
 		boolToInt(record.Failed),
 		nonNegativeInt(record.FailureStatusCode),
 		strings.TrimSpace(record.FailureBody),
+		cost,
 	)
 	if err != nil {
 		return fmt.Errorf("usage sqlite insert: %w", err)
@@ -316,7 +329,7 @@ func (s *SQLiteStore) Query(ctx context.Context, rng QueryRange) (APIUsage, erro
 
 	result := APIUsage{}
 	for rows.Next() {
-		detail, apiKey, _, err := scanRequestDetail(rows)
+		detail, apiKey, _, _, err := scanRequestDetail(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -388,7 +401,7 @@ func (s *SQLiteStore) AccountSummary(ctx context.Context, rng QueryRange) (Accou
 	accounts := make(map[accountKey]*AccountUsage)
 	for _, gk := range keys {
 		g := groups[gk]
-		model, pureInput := g.model, g.pureInput
+		model := g.model
 		group := AccountUsage{
 			AuthIndex: g.authIndex, AuthID: g.authID, Source: g.source, Provider: g.provider, AuthType: g.authType,
 			Requests: g.requests, Failed: g.failed, Tokens: g.tokens,
@@ -414,12 +427,14 @@ func (s *SQLiteStore) AccountSummary(ctx context.Context, rng QueryRange) (Accou
 		} else {
 			mergeAccountGroup(account, group)
 		}
-		if price, ok := s.priceFor(model); ok {
-			cost := costUSD(price, pureInput, group.Tokens.CachedTokens, group.Tokens.CacheCreationTokens, group.Tokens.OutputTokens)
-			account.CostUSD += cost
-			rounded := roundUSD(cost)
+		// Costs were fixed when each request was written, at the price in effect then.
+		// A model counts as unpriced while any of its requests was written without a price.
+		if g.requests > g.unpriced {
+			account.CostUSD += g.cost
+			rounded := roundUSD(g.cost)
 			modelUsage.CostUSD = &rounded
-		} else {
+		}
+		if g.unpriced > 0 {
 			account.UnpricedModels = append(account.UnpricedModels, model)
 		}
 		account.Models = append(account.Models, modelUsage)
@@ -471,17 +486,6 @@ func mergeAccountGroup(account *AccountUsage, group AccountUsage) {
 	if group.LastRequestAt.After(account.LastRequestAt) {
 		account.LastRequestAt = group.LastRequestAt
 	}
-}
-
-// recordCost prices one record, or returns nil when its model has no price.
-func (s *SQLiteStore) recordCost(detail RequestDetail) *float64 {
-	price, ok := s.priceFor(detail.Model)
-	if !ok {
-		return nil
-	}
-	cost := roundUSD(costUSD(price, pureInputTokens(detail.Provider, detail.Tokens),
-		detail.Tokens.CachedTokens, detail.Tokens.CacheCreationTokens, detail.Tokens.OutputTokens))
-	return &cost
 }
 
 // ListRecords returns one page of records newest first, optionally filtered by
@@ -565,7 +569,7 @@ func (s *SQLiteStore) ListRecords(ctx context.Context, q RecordsQuery) (RecordsP
 
 	var lastTimestampText string
 	for rows.Next() {
-		detail, _, timestampText, err := scanRequestDetail(rows)
+		detail, _, timestampText, cost, err := scanRequestDetail(rows)
 		if err != nil {
 			return page, err
 		}
@@ -574,7 +578,7 @@ func (s *SQLiteStore) ListRecords(ctx context.Context, q RecordsQuery) (RecordsP
 			page.NextCursor = &next
 			break
 		}
-		page.Records = append(page.Records, RecordDetail{RequestDetail: detail, CostUSD: s.recordCost(detail)})
+		page.Records = append(page.Records, RecordDetail{RequestDetail: detail, CostUSD: cost})
 		lastTimestampText = timestampText
 	}
 	if err := rows.Err(); err != nil {
@@ -599,11 +603,13 @@ func rangeWhere(rng QueryRange) ([]string, []any) {
 }
 
 // scanRequestDetail scans one row selected with recordColumns. It also returns
-// the api_key (not part of RequestDetail) and the raw stored timestamp text.
-func scanRequestDetail(rows *sql.Rows) (RequestDetail, string, string, error) {
+// the api_key (not part of RequestDetail), the raw stored timestamp text and the
+// cost fixed when the record was written (nil when its model had no price then).
+func scanRequestDetail(rows *sql.Rows) (RequestDetail, string, string, *float64, error) {
 	var timestampText string
 	var apiKey string
 	var failedInt int
+	var storedCost sql.NullFloat64
 	detail := RequestDetail{}
 	if err := rows.Scan(
 		&detail.ID,
@@ -631,18 +637,24 @@ func scanRequestDetail(rows *sql.Rows) (RequestDetail, string, string, error) {
 		&failedInt,
 		&detail.FailureStatusCode,
 		&detail.FailureBody,
+		&storedCost,
 	); err != nil {
-		return detail, "", "", fmt.Errorf("usage sqlite scan: %w", err)
+		return detail, "", "", nil, fmt.Errorf("usage sqlite scan: %w", err)
 	}
 	parsed, err := parseStoredTimestamp(timestampText)
 	if err != nil {
-		return detail, "", "", err
+		return detail, "", "", nil, err
 	}
 	detail.Timestamp = parsed
 	detail.LatencyMs = nonNegative(detail.LatencyMs)
 	detail.TTFTMs = nonNegative(detail.TTFTMs)
 	detail.Failed = failedInt != 0
-	return detail, apiKey, timestampText, nil
+	var cost *float64
+	if storedCost.Valid {
+		rounded := roundUSD(storedCost.Float64)
+		cost = &rounded
+	}
+	return detail, apiKey, timestampText, cost, nil
 }
 
 func parseStoredTimestamp(text string) (time.Time, error) {

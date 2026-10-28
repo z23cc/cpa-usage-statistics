@@ -505,7 +505,7 @@ func TestSchemaCompatibility(t *testing.T) {
 	_ = rows.Close()
 	want := "id,timestamp,api_key,provider,model,alias,source,auth_id,auth_index,auth_type,executor_type," +
 		"reasoning_effort,service_tier,latency_ms,ttft_ms,input_tokens,output_tokens,reasoning_tokens," +
-		"cached_tokens,cache_read_tokens,cache_creation_tokens,total_tokens,failed,failure_status_code,failure_body"
+		"cached_tokens,cache_read_tokens,cache_creation_tokens,total_tokens,failed,failure_status_code,failure_body,cost_usd"
 	if strings.Join(cols, ",") != want {
 		t.Fatalf("columns = %v", cols)
 	}
